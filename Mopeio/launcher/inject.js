@@ -3,6 +3,15 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 
+// The userscript ships as a gzip+base64 archive under ../src; decode it at startup.
+function loadScript() {
+  const dir = path.join(__dirname, '..', 'src');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.b64')).sort();
+  if (!files.length) throw new Error(`No userscript archive found in ${dir}`);
+  const b64 = files.map(f => fs.readFileSync(path.join(dir, f), 'utf8').replace(/\s+/g, '')).join('');
+  return require('node:zlib').gunzipSync(Buffer.from(b64, 'base64')).toString('utf8');
+}
+
 function getJson(url, timeout = 1500) {
   return new Promise((resolve, reject) => {
     let timer;
@@ -164,7 +173,7 @@ async function main() {
   if (typeof WebSocket !== 'function') throw new Error('Node.js 22 or newer is required');
   const game = new URL(process.env.MOPE_URL || 'https://mope.io/');
   if (!['https:', 'http:'].includes(game.protocol)) throw new Error('MOPE_URL must be an HTTP(S) URL');
-  const source = fs.readFileSync(path.join(__dirname, '..', 'mope-cheat.user.js'), 'utf8');
+  const source = loadScript();
   const ws = await openSocket(await waitForEndpoint(port));
   try {
     await inject(new CDP(ws), source, game.href);
