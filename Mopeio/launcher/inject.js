@@ -132,15 +132,26 @@ async function inject(cdp, source, game) {
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source }, sessionId);
   const result = await cdp.send('Page.navigate', { url: game }, sessionId, 20000);
   if (result.errorText) throw navError(result.errorText, game);
-  const deadline = Date.now() + 15000;
+  const reload = await cdp.send('Page.reload', {}, sessionId, 20000).catch(err => ({ errorText: err.message }));
+  if (reload.errorText) throw navError(reload.errorText, game);
+  const deadline = Date.now() + 20000;
   let url = '';
   while (Date.now() < deadline) {
     url = await currentUrl(cdp, sessionId);
-    if (sameOrigin(url, game)) return target.targetId;
+    if (sameOrigin(url, game)) {
+      const panel = await cdp.send('Runtime.evaluate', {
+        expression: 'Boolean(window.__mopeHook || document.getElementById("mopeCheatPanel"))',
+        returnByValue: true,
+      }, sessionId, 5000).catch(() => null);
+      if (panel?.result?.value) {
+        console.log('[mope] Чит загружен: панель должна быть слева сверху.');
+        return target.targetId;
+      }
+    }
     if (!url || url === 'about:blank') {
       await cdp.send('Runtime.evaluate', { expression: `location.href = ${JSON.stringify(game)}` }, sessionId, 5000).catch(() => {});
     }
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
   throw new Error(
     url ? `Вкладка осталась на ${url}, а не ${game}.` : `Не удалось открыть ${game}: вкладка не отвечает.`,

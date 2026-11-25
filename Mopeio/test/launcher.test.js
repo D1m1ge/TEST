@@ -63,12 +63,12 @@ test('inject reuses the game tab, registers userscript before navigation and rep
       : m.method === 'Target.createTarget' ? { targetId: 'target' }
       : m.method === 'Target.attachToTarget' ? { sessionId: 'session' }
       : m.method === 'Page.navigate' && fail ? { errorText: 'ERR_FAILED' }
-      : m.method === 'Runtime.evaluate' ? { result: { value: 'https://mope.io/' } }
+      : m.method === 'Runtime.evaluate' ? { result: { value: m.params.expression.includes('__mopeHook') ? true : 'https://mope.io/' } }
       : {};
     queueMicrotask(() => ws.emit('message', { data: JSON.stringify({ id: m.id, result }) }));
   };
   assert.equal(await inject(cdp, 'source', 'https://mope.io/'), 'target');
-  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.createTarget', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Runtime.evaluate']);
+  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.createTarget', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Page.reload', 'Runtime.evaluate', 'Runtime.evaluate']);
   assert.equal(methods[4].params.source, 'source');
   assert.equal(methods[5].sessionId, 'session');
   fail = true;
@@ -82,10 +82,10 @@ test('inject attaches to an already opened game tab without creating one', async
     const m = JSON.parse(data); methods.push(m);
     const result = m.method === 'Target.getTargets' ? { targetInfos: [{ targetId: 'game-tab', type: 'page', url: 'https://mope.io/' }] }
       : m.method === 'Target.attachToTarget' ? { sessionId: 'session' }
-      : m.method === 'Runtime.evaluate' ? { result: { value: 'https://mope.io/' } }
+      : m.method === 'Runtime.evaluate' ? { result: { value: m.params.expression.includes('__mopeHook') ? true : 'https://mope.io/' } }
       : {};
     queueMicrotask(() => ws.emit('message', { data: JSON.stringify({ id: m.id, result }) }));
   };
   assert.equal(await inject(cdp, 'source', 'https://mope.io/'), 'game-tab');
-  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Runtime.evaluate']);
+  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Page.reload', 'Runtime.evaluate', 'Runtime.evaluate']);
 });
