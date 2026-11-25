@@ -69,10 +69,12 @@ test('tactics: U loop alternates flanks, windback snaps back, clockwork orbits, 
   const u1 = PVP.uMoonwalk(me, foe, reach, 450, opts);           // half a cycle later: other flank
   assert.ok(u0.y !== u1.y && Math.sign(u0.y) !== Math.sign(u1.y));
   assert.ok(Math.hypot(u0.x - me.x, u0.y - me.y) >= reach - 1e-6);
-  const wHold = PVP.windback(me, foe, reach, 100, opts);         // inside the hold window
-  const wBack = PVP.windback(me, foe, reach, 300, opts);         // past 60%: the snap-back
+  const wHold = PVP.windback(me, foe, reach, 100, opts);         // inside the hold window, past the boost edge
+  const wBack = PVP.windback(me, foe, reach, 300, opts);         // past 60%: the snap-back (no boost on retreat)
+  const wRet = PVP.windback(me, foe, reach, 30, opts);           // first 20% of the cycle: the RETURN onto the bite line
   assert.equal(wHold.boost, false);
-  assert.equal(wBack.boost, true);
+  assert.equal(wBack.boost, false);   // boost on the retreat drove the body AWAY from the foe
+  assert.equal(wRet.boost, true);     // boost fires on the return, at the second tail presentation
   assert.ok(Math.abs(wBack.y) > Math.abs(wHold.y));
   const c0 = PVP.clockwork(me, foe, reach, 0, opts);
   const c1 = PVP.clockwork(me, foe, reach, 155, opts);           // quarter lap later
@@ -87,4 +89,28 @@ test('tactics: U loop alternates flanks, windback snaps back, clockwork orbits, 
   assert.ok(Math.sign(s0.y) !== Math.sign(s1.y));
   const b = PVP.bait(me, foe, reach, 0, opts);
   assert.ok(Math.hypot(b.x - foe.x, b.y - foe.y) <= reach * opts.gapR + reach + 1e-6);
+});
+
+test('tactic phase survives a fresh opts object per tick and stays inside the 4 rad/s turn clamp', () => {
+  const me = origin, foe = { x: 100, y: 0 }, reach = 40;
+  // The product pattern: the tick builds a NEW opts literal every 4 ms and carries the phase clock in
+  // bot (startAt). Regression for the frozen-phase bug, where o.startAt lived in that literal and
+  // every tactic ran at t=0 forever: U = one static angle, windback = no swing, clockwork = one point.
+  const prod = (fn, t) => fn(me, foe, reach, t,
+    { cycleMs: 1800, turn: 1.2, holdMs: 1750, backDeg: 150, lapMs: 4000, ringR: 1.35, startAt: 0 });
+  const uPts = [0, 300, 600, 900, 1350].map(t => prod(PVP.uMoonwalk, t));
+  assert.ok(new Set(uPts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)).size > 2,
+    'U cursor must move over time when the tick passes a fresh opts object');
+  const wPts = [0, 437, 875, 1312, 1750].map(t => prod(PVP.windback, t));
+  assert.ok(new Set(wPts.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`)).size >= 2,
+    'windback cursor must swing back and return over time');
+  const cPts = [0, 1000, 2000, 3000].map(t => prod(PVP.clockwork, t));
+  assert.ok(new Set(cPts.map(p => `${p.ring.x.toFixed(1)},${p.ring.y.toFixed(1)}`)).size > 2,
+    'clockwork ring point must orbit over time');
+  // The shipped constants must keep the body able to follow: peak cursor swing A*2pi/T <= ~4.2 rad/s
+  // (the client turn clamp) and a clockwork lap the body speed v=~84 at R=1.35*reach can hold (~4 s).
+  assert.ok(1.2 * Math.PI * 2 / 1800 <= 4.2, 'U swing rate within the turn clamp');
+  assert.ok(4000 >= 3600, 'clockwork lap long enough for the body to hold the ring');
+  // Windback back-window = last 40% of the cycle must give the 150-deg swing >= ~650 ms at 4 rad/s.
+  assert.ok(1750 * 0.4 >= 650, 'windback back window covers a full 150-deg body turn');
 });

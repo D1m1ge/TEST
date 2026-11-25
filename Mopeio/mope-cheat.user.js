@@ -270,15 +270,23 @@
     // --- TACTICS (from the guide video): one active at a time, on top of the phase engine.
     //     'universal' = no override, the phase engine picks from geometry. Times are ms (UNCALIBRATED).
     tactic: 'universal',
-    tacticUCycleMs: 900,     // U-moonwalk: one full left-to-right U loop
-    tacticUTurn: 1.9,        // rad of cursor swing per half-loop (the U's depth)
-    tacticWindbackMs: 420,   // windback: hold the bite line, then snap the cursor back this long
+    tacticUCycleMs: 1800,    // U-moonwalk: one full left-to-right U loop. Peak cursor swing rate is
+                             // A*2pi/T = 1.2*6.28/1.8 ~= 4.2 rad/s -- at the body's own 4 rad/s turn
+                             // clamp. The old 1.9 rad / 900 ms demanded 13.3 rad/s: three times past
+                             // the clamp, the body never tracked the arc and the U became a slow slide.
+    tacticUTurn: 1.2,        // rad of cursor swing per half-loop (the U's depth). 1.9 rad was described
+                             // as a 180-deg turn but is only 109 deg; 1.2 rad (~69 deg) per half still
+                             // crosses flanks and is the most the body can actually follow.
+    tacticWindbackMs: 1750,  // windback FULL cycle: hold the bite line, then snap the cursor back. The
+                             // back window is the last 40%, so the swing-back itself gets 700 ms -- the
+                             // old 420 ms cycle gave the 150-deg swing 168 ms while the body needs
+                             // 654 ms at its 4 rad/s clamp: the windback aborted its own turn.
     tacticWindbackDeg: 150,  // how far back the cursor swings on the windback
     tacticClockR: 1.35,      // clockwork orbit radius, in reaches (arena duel sat far outside bite range)
-    tacticClockMs: 2600,     // clockwork full-lap period. Holding a ring of R at body speed v needs an
-                             // angular rate v/R; at R=1.35*reach that is ~2.4 rad/s against the client's
-                             // 4 rad/s turn clamp, so 400 ms (15.7 rad/s) was never executable: the bot
-                             // just spun in place. 2.6 s is the fastest ring the body can actually hold.
+    tacticClockMs: 4000,     // clockwork full-lap period. Holding a ring of R needs body speed v/R in
+                             // rad/s: at R=1.35*reach (~54 units) and v=84 that is 1.55 rad/s, i.e. a
+                             // ~4 s lap. 400 ms (15.7 rad/s) and even 2.6 s asked the body to hold a
+                             // ring faster than it can circle it, so the bot lagged into a spiral.
     tacticStraightMs: 1200,  // straight-line moonwalk: retreat along the aim line this long, then re-check
     tacticSwitchEvery: 2,    // switchside: change flanks after this many straight retreats
     tacticDefBoostR: 2.0,    // defensive boost: fire when a foe nose is this close, in reaches
@@ -459,11 +467,12 @@
       // `base + PI - backDeg*0.5` gave 105 deg -- a 35%-speed arc, and the "back" was 75 deg off true.
       const a = back ? base + o.backDeg * Math.PI / 180 : base;
       // Hold phase stands OFF the foe model the way the rest of PvP does (approachGap), it does not park
-      // the cursor inside it. Boost fires only on the leading edge of the swing: asking for it across the
-      // whole 40% window was up to 2.4 boosts/s against the guide's "conserve boosts".
+      // the cursor inside it. Boost fires on the RETURN onto the bite line (the first part of the hold
+      // phase, right after the backswing ended): dashing while the cursor still points away drove the
+      // body away from the foe, and across the whole 40% window it was up to 2.4 boosts/s.
       const dist = Math.hypot(foe.x - me.x, foe.y - me.y);
       const d = back ? reach * 2.2 : Math.max(reach, dist - reach * 0.3);
-      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: back && ph < 0.85 };
+      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: !back && ph < 0.2 };
     }
     // Clockwork (strategy): constant angular speed on a fixed ring around the foe, nose leaned inward.
     // The cursor IS the ring point (measured from the foe), so the orbit radius never drifts with
@@ -474,6 +483,10 @@
       const r = reach * o.ringR;
       const px = foe.x + Math.cos(t) * r, py = foe.y + Math.sin(t) * r;
       const dx = px - me.x, dy = py - me.y, l = Math.hypot(dx, dy) || 1;
+      // Already on the ring: the old step = l*1.05 collapsed to ~0 and the client could read a cursor
+      // parked on our own nose as "no command". Park the cursor ON the ring point instead so the
+      // tangent motion keeps a real direction.
+      if (l < reach * 0.15) return { x: px, y: py, boost: false, ring: { x: px, y: py } };
       const step = Math.min(l * 1.05, l + reach * 0.1);        // real slight overshoot, bounded by the ring
       return { x: me.x + dx / l * step, y: me.y + dy / l * step, boost: false, ring: { x: px, y: py } };
     }
@@ -759,8 +772,11 @@
     wheel.x = wheel.y = NaN;
     const hop = wheel.hop;
     wheel.hop = null;
-    if (hop && CFG.whip && (bot.mode === 'whip' || String(bot.mode || '').startsWith('tactic:')) &&
-        bot.whipReady &&
+    // Whip mode boosts only through its own armed hop; a tactic's boost request is the tactic's OWN
+    // path and must not depend on CFG.whip/bot.whipReady -- playing a tactic without F8 used to
+    // silently drop every windback/defboost dash at the pump.
+    const tacticHop = String(bot.mode || '').startsWith('tactic:');
+    if (hop && (bot.mode === 'whip' || tacticHop) && (bot.whipReady || tacticHop) &&
         hop.lap === bot.whipLap && hop.target === bot.target && !bot.whipHopped && boost(M, me)) {
       bot.whipHopAt = sent;
       bot.whipHopped = true;
@@ -1269,7 +1285,11 @@
     // Guide rule 1 (conserve boosts): no finishing dart on a low tank, and rule 2 (be unpredictable):
     // never re-dash on the same rhythm -- a small alternating phase jitter spreads the cadence.
     const resBudget = !res || res.max <= 0 || res.value >= (CFG.dashMinRes + (bot.dashAlt ? 0.1 : 0)) * res.max;
-    const boostReady = CFG.lunge && (now - bot.lastDash >= CFG.dashCdMs * (bot.dashAlt ? 1.25 : 1)) && resBudget;
+    // A tactic's boost is the tactic's own decision (the r.boost the branch sends); it must not hang
+    // on the F8 whip toggle CFG.lunge. Cooldown and resource budget still apply to every dash.
+    const tacticActive = CFG.pvp && CFG.tactic !== 'universal';
+    const boostReady = (CFG.lunge || tacticActive) &&
+      (now - bot.lastDash >= CFG.dashCdMs * (bot.dashAlt ? 1.25 : 1)) && resBudget;
     // the hexagon darts must work even with the finishing-dart tuning off
     const whipReady = (now - bot.lastDash >= CFG.dashCdMs) &&
       (!res || res.max <= 0 || res.value >= CFG.dashMinRes * res.max);
@@ -1313,13 +1333,20 @@
       const T = CFG;
       const f = { x: B.x, y: B.y };
       const clos = closingRate(chosen.id, mx, my);
+      // The phase clock lives in `bot`, NOT in the opts literal: the tick builds a fresh opts object
+      // every 4 ms, so an `o.startAt` written there died with the object and `now - startAt` was always
+      // 0 -- every tactic ran frozen at t=0 (U = one static angle, windback = no swing ever, clockwork
+      // = one fixed ring point). Reset the clock when the stance or the target changes.
+      const tacticKey = CFG.tactic + ':' + (chosen && chosen.id);
+      if (bot.tacticKey !== tacticKey) { bot.tacticKey = tacticKey; bot.tacticSince = now; }
+      if (bot.tacticFailKey !== tacticKey) { bot.tacticFailKey = tacticKey; bot.tacticFailSince = now; }
       let r = null;
       if (CFG.tactic === 'u') r = PVP.uMoonwalk({ x: mx, y: my }, f, reach, now,
-        { cycleMs: T.tacticUCycleMs, turn: T.tacticUTurn });
+        { cycleMs: T.tacticUCycleMs, turn: T.tacticUTurn, startAt: bot.tacticSince });
       else if (CFG.tactic === 'windback') r = PVP.windback({ x: mx, y: my }, f, reach, now,
-        { holdMs: T.tacticWindbackMs, backDeg: T.tacticWindbackDeg });
+        { holdMs: T.tacticWindbackMs, backDeg: T.tacticWindbackDeg, startAt: bot.tacticSince });
       else if (CFG.tactic === 'clockwork') r = PVP.clockwork({ x: mx, y: my }, f, reach, now,
-        { lapMs: T.tacticClockMs, ringR: T.tacticClockR });
+        { lapMs: T.tacticClockMs, ringR: T.tacticClockR, startAt: bot.tacticSince });
       else if (CFG.tactic === 'straight') r = PVP.straightMoonwalk({ x: mx, y: my }, f, reach, now,
         { holdMs: T.tacticStraightMs });
       else if (CFG.tactic === 'switchside') r = PVP.switchsideMoonwalk({ x: mx, y: my }, f, reach, now,
@@ -1335,13 +1362,15 @@
         const z = arenaKeepInside(me, r.x, r.y);
         const pulled = Math.hypot(z.x - r.x, z.y - r.y) > reach * 0.6;
         r = pulled ? PVP.uMoonwalk({ x: mx, y: my }, f, reach, now,
-          { cycleMs: T.tacticUCycleMs, turn: T.tacticUTurn }) : r;
+          { cycleMs: T.tacticUCycleMs, turn: T.tacticUTurn, startAt: bot.tacticFailSince }) : r;
       }
       if (r) {
-        // A tactic is a stance, not a cage: when the bite geometry says the tail is THERE (rear sector,
-        // aligned), the attack branches own the frame -- the old early return made every tactic pure
-        // circling that could never end in a bite, which is what "вихрь просто кружит" was.
-        if (geo.inRearSector) {
+        // A tactic is a stance, not a cage: when the bite geometry says the tail is THERE AND CLOSE
+        // (rear sector, aligned, within 1.6 reaches), the attack branches own the frame -- the old
+        // early return made every tactic pure circling that could never end in a bite, which is what
+        // "вихрь просто кружит" was. The distance bound keeps a defensive stance from being abandoned
+        // just because a fleeing foe's tail is technically behind us 15 reaches away.
+        if (geo.inRearSector && geo.centerDistance < reach * 1.6) {
           bot.mode = 'tactic-bite:' + CFG.tactic;
           steer(M, me, chosen.tail.x + tx * mr * CFG.biteLeadFrac, chosen.tail.y + ty * mr * CFG.biteLeadFrac);
           if (boostReady && geo.mouthToTail <= er * CFG.biteReachFrac && geo.aligned) boost(M, me);
@@ -1754,9 +1783,9 @@
   // frame back to the phase engine; a named tactic owns the cursor until switched off or replaced.
   const TACTIC_ROWS = [
     ['universal', 'Универсальное ПвП', 'Базовый режим: фазовый движок сам выбирает поведение по геометрии (уклон, тряска, деф, вихрь, байт, укус, рывок) и соблюдает правила из гайда — беречь буст, не повторять одно и то же движение, не лезть за стену арены.'],
-    ['u', 'U Moonwalk (деф)', 'Дуга «U»: заход одним бортом, разворот носа на 180° через линию противника, выход другим бортом, повтор. Курсор ведётся плавно, без рывков; при срыве противника в погоню петля не дожимается — разворот лицом.'],
-    ['windback', 'Windback (атака)', 'Держим линию укуса, затем резкий откат курсора назад: противник, разворачиваясь в ответ, подставляет хвост второй раз. Рывок в момент отката.'],
-    ['clockwork', 'Clockwork (стратегия)', 'Равномерное вращение по кругу вокруг противника с постоянной угловой скоростью, нос чуть внутрь круга. Изматывание и выживание в зоне; буст не тратится. Выход в укус, когда противник потерял позицию.'],
+    ['u', 'U Moonwalk (деф)', 'Дуга «U»: заход одним бортом, плавный разворот носа через линию противника (~70° за полпетли — столько реально выдерживает поворот тела), выход другим бортом, повтор. Курсор ведётся непрерывно; при срыве противника в погоню петля не дожимается — разворот лицом.'],
+    ['windback', 'Windback (атака)', 'Держим линию укуса, затем резкий откат курсора назад: противник, разворачиваясь в ответ, подставляет хвост второй раз. Рывок — на возврате к линии укуса, в момент второго подстава.'],
+    ['clockwork', 'Clockwork (стратегия)', 'Вращение по кругу вокруг противника, нос чуть внутрь круга: период 4 с подобран под физический поворот тела, круг реально удерживается. Изматывание и выживание в зоне; буст не тратится. Выход в укус, когда противник потерял позицию.'],
     ['straight', 'Straight Line Moonwalk (деф)', 'Отход по прямой «лунной походкой»: курсор за спиной, тело пятится. Если прямая ведёт в стену или красный круг — переключиться на U-петлю (Failsafe), не меняя ритма.'],
     ['switchside', 'Switchside Moonwalk (деф)', 'Тот же отход, но со сменой борта каждые несколько циклов: противник не может предсказать, с какой стороны заходить.'],
     ['defboost', 'Defensive Boost (деф)', 'Рывок не от противника, а по дуге 60–90° в сторону от траектории его носа, с сохранением дистанции. Тратится только когда нос противника уже смотрит на нас.'],
