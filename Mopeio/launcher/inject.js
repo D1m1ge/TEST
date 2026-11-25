@@ -3,14 +3,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 
-// The userscript is stored as ordered parts under ../src; join them at startup.
+// The userscript ships as a gzip+base64 archive under ../src; decode it at startup.
 function loadScript() {
   const dir = path.join(__dirname, '..', 'src');
-  const parts = fs.readdirSync(dir)
-    .filter(f => /^mope\.part\d+\.js$/.test(f))
-    .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
-  if (!parts.length) throw new Error(`No userscript parts found in ${dir}`);
-  return parts.map(f => fs.readFileSync(path.join(dir, f), 'utf8')).join('');
+  const files = fs.readdirSync(dir).filter(f => f.endsWith('.b64')).sort();
+  if (!files.length) throw new Error(`No userscript archive found in ${dir}`);
+  const b64 = files.map(f => fs.readFileSync(path.join(dir, f), 'utf8').replace(/\s+/g, '')).join('');
+  return require('node:zlib').gunzipSync(Buffer.from(b64, 'base64')).toString('utf8');
 }
 
 function getJson(url, timeout = 1500) {

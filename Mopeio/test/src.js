@@ -1,18 +1,22 @@
 'use strict';
-// The userscript is stored as ordered parts under ../src so the GitHub connector
-// can carry it in pieces; every consumer (launcher, tests) joins them the same way.
+// The userscript ships as a gzip+base64 archive under ../src so the GitHub connector
+// can carry it in one small file; every consumer (launcher, tests) decodes it the same way.
 const fs = require('node:fs');
 const path = require('node:path');
+const zlib = require('node:zlib');
 
-function partFiles() {
+function archiveFiles() {
   const dir = path.join(__dirname, '..', 'src');
   return fs.readdirSync(dir)
-    .filter(f => /^mope\.part\d+\.js$/.test(f))
-    .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+    .filter(f => f.endsWith('.b64'))
+    .sort();
 }
 
 function loadSource() {
-  return partFiles().map(f => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8')).join('');
+  const files = archiveFiles();
+  if (!files.length) throw new Error('No userscript archive found in src/*.b64');
+  const b64 = files.map(f => fs.readFileSync(path.join(__dirname, '..', 'src', f), 'utf8').replace(/\s+/g, '')).join('');
+  return zlib.gunzipSync(Buffer.from(b64, 'base64')).toString('utf8');
 }
 
-module.exports = { loadSource, partFiles };
+module.exports = { loadSource, archiveFiles };
