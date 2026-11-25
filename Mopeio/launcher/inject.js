@@ -3,6 +3,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
 
+// The userscript is stored as ordered parts under ../src; join them at startup.
+function loadScript() {
+  const dir = path.join(__dirname, '..', 'src');
+  const parts = fs.readdirSync(dir)
+    .filter(f => /^mope\.part\d+\.js$/.test(f))
+    .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+  if (!parts.length) throw new Error(`No userscript parts found in ${dir}`);
+  return parts.map(f => fs.readFileSync(path.join(dir, f), 'utf8')).join('');
+}
+
 function getJson(url, timeout = 1500) {
   return new Promise((resolve, reject) => {
     let timer;
@@ -164,7 +174,7 @@ async function main() {
   if (typeof WebSocket !== 'function') throw new Error('Node.js 22 or newer is required');
   const game = new URL(process.env.MOPE_URL || 'https://mope.io/');
   if (!['https:', 'http:'].includes(game.protocol)) throw new Error('MOPE_URL must be an HTTP(S) URL');
-  const source = fs.readFileSync(path.join(__dirname, '..', 'mope-cheat.user.js'), 'utf8');
+  const source = loadScript();
   const ws = await openSocket(await waitForEndpoint(port));
   try {
     await inject(new CDP(ws), source, game.href);
