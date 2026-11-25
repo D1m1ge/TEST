@@ -776,8 +776,12 @@
     // path and must not depend on CFG.whip/bot.whipReady -- playing a tactic without F8 used to
     // silently drop every windback/defboost dash at the pump.
     const tacticHop = String(bot.mode || '').startsWith('tactic:');
+    // whipHopped is the whip's per-waypoint latch and whipStep -- the only thing that clears it -- runs
+    // only under CFG.whip. A tactic hop must ignore it, or the first tactic boost (default whip off)
+    // latches us and every later windback/defboost dash is dropped until the next respawn.
     if (hop && (bot.mode === 'whip' || tacticHop) && (bot.whipReady || tacticHop) &&
-        hop.lap === bot.whipLap && hop.target === bot.target && !bot.whipHopped && boost(M, me)) {
+        hop.lap === bot.whipLap && hop.target === bot.target && (tacticHop || !bot.whipHopped) &&
+        boost(M, me)) {
       bot.whipHopAt = sent;
       bot.whipHopped = true;
     }

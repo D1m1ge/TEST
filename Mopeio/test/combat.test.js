@@ -114,3 +114,13 @@ test('tactic phase survives a fresh opts object per tick and stays inside the 4 
   // Windback back-window = last 40% of the cycle must give the 150-deg swing >= ~650 ms at 4 rad/s.
   assert.ok(1750 * 0.4 >= 650, 'windback back window covers a full 150-deg body turn');
 });
+
+test('tactic boost ignores the whip per-waypoint latch (whip off is the default)', () => {
+  // Regression: whipHopped is cleared only inside whipStep, which runs only under CFG.whip, so with F8
+  // off the first tactic dash latched it and every later windback/defboost dash was dropped. The hop
+  // gate must therefore let a tactic hop through while the whip keeps honouring its per-waypoint latch.
+  const gate = source.split('\n').find(line => line.includes('hop.lap === bot.whipLap'));
+  assert.ok(gate, 'pumpWheel hop gate found in the userscript');
+  assert.ok(gate.includes('(tacticHop || !bot.whipHopped)'),
+    'tactic hops bypass the whip latch; whip hops still respect it');
+});
