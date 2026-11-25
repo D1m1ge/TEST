@@ -76,8 +76,8 @@
     leadSec: 0.25,       //         UNCALIBRATED aim-ahead for a moving tail
     tailFrac: 2 / 2.15,  //         tail offset from centre, in radii (sprite: size.x / 2.15)
     dashHoldMs: 150,     //         UNCALIBRATED boost press length
-    dashCdMs: 460,       //         UNCALIBRATED min gap between boosts (lower = darts more often)
-    dashMinRes: 0.2,     //         UNCALIBRATED fraction of the resource bar a boost needs
+    dashCdMs: 340,       //         UNCALIBRATED min gap between boosts (lower = darts more often)
+    dashMinRes: 0.15,    //         UNCALIBRATED fraction of the resource bar a boost needs
     weave: 0.45,         //         radians of side-to-side while running from a predator
     faceWagMs: 100,      //         UNCALIBRATED ms for a full left-right nose-shake (lower = snappier)
     pvpWeave: 0.62,      //         RADIANS the approach cursor sits off the foe line at full swing. These
@@ -274,8 +274,8 @@
     tacticUTurn: 1.9,        // rad of cursor swing per half-loop (the U's depth)
     tacticWindbackMs: 420,   // windback: hold the bite line, then snap the cursor back this long
     tacticWindbackDeg: 150,  // how far back the cursor swings on the windback
-    tacticClockR: 1.6,       // clockwork orbit radius, in reaches (constant angular speed)
-    tacticClockMs: 620,      // clockwork full-lap period
+    tacticClockR: 1.35,      // clockwork orbit radius, in reaches (arena duel sat far outside bite range)
+    tacticClockMs: 400,      // clockwork full-lap period (620 read as slow aimless circling on the arena)
     tacticStraightMs: 1200,  // straight-line moonwalk: retreat along the aim line this long, then re-check
     tacticSwitchEvery: 2,    // switchside: change flanks after this many straight retreats
     tacticDefBoostR: 2.0,    // defensive boost: fire when a foe nose is this close, in reaches
