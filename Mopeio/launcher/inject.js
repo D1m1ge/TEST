@@ -84,14 +84,14 @@ class CDP {
     ws.addEventListener('close', close);
     ws.addEventListener('error', close);
   }
-  send(method, params = {}, sessionId) {
+  send(method, params = {}, sessionId, timeout = this.timeout) {
     if (this.closed) return Promise.reject(new Error('CDP connection closed'));
     return new Promise((resolve, reject) => {
       const id = ++this.id;
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error(`CDP timeout: ${method}`));
-      }, this.timeout);
+      }, timeout);
       this.pending.set(id, { resolve, reject, timer });
       try { this.ws.send(JSON.stringify({ id, method, params, sessionId })); }
       catch (err) { clearTimeout(timer); this.pending.delete(id); reject(err); }
@@ -104,9 +104,28 @@ async function inject(cdp, source, game) {
   const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
   await cdp.send('Page.enable', {}, sessionId);
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source }, sessionId);
-  const result = await cdp.send('Page.navigate', { url: game }, sessionId);
-  if (result.errorText) throw new Error(`Navigation failed: ${result.errorText}`);
-  return targetId;
+  let lastError = 'unknown error';
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const result = await cdp.send('Page.navigate', { url: game }, sessionId, 20000);
+      if (result.errorText) {
+        const offline = /ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ERR_PROXY|ERR_TIMED_OUT|ERR_BLOCKED/i.test(result.errorText);
+        if (offline) {
+          throw new Error(
+            `Не удалось открыть ${game} (${result.errorText}). ` +
+            'Проверь интернет, а если сайт блокируется — запусти launcher через VPN.',
+          );
+        }
+        throw new Error(`Navigation failed: ${result.errorText}`);
+      }
+      return targetId;
+    } catch (err) {
+      lastError = err.message;
+      if (/Не удалось открыть|Navigation failed/.test(lastError)) throw err;
+    }
+    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 2000));
+  }
+  throw new Error(`Navigation failed: ${lastError}`);
 }
 
 async function main() {
@@ -124,5 +143,15 @@ async function main() {
   } catch (err) { ws.close(); throw err; }
 }
 
-if (require.main === module) main().catch(err => { console.error('[mope]', err.message); process.exitCode = 1; });
+function pauseOnWindows() {
+  if (process.platform === 'win32' && process.env.MOPE_NO_PAUSE !== '1' && !process.exitCode) return;
+  if (process.platform === 'win32') {
+    console.error('[mope] Нажми Enter, чтобы закрыть это окно.');
+    try { require('node:readline').createInterface({ input: process.stdin }).question('', () => {}); } catch {}
+  }
+}
+
+if (require.main === module) {
+  main().catch(err => { console.error('[mope]', err.message); process.exitCode = 1; }).finally(pauseOnWindows);
+}
 module.exports = { getJson, waitForEndpoint, openSocket, CDP, inject };
