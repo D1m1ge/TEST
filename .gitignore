@@ -1,3 +1,4 @@
-# Built from Mopeio/src/*.b64 by the launcher/tests; kept out of git so the
-# repository stays connector-friendly (parts only).
-Mopeio/mope-cheat.user.js
+# The built monolith Mopeio/mope-cheat.user.js IS tracked in git on purpose:
+# Tampermonkey installs the raw GitHub URL of that file. The src/*.b64 parts
+# exist only so the GitHub connector can carry the script in small chunks;
+# the launcher and tests decode the parts and rebuild the monolith.
