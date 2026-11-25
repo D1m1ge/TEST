@@ -664,8 +664,11 @@
     return n;
   }
 
+  // mope.io wire protocol: opcode 114 is the client's pointer/cursor packet
+  const CURSOR_OP = 114;
+
   function wrappedZx(op, payload, flag) {
-    if (op === 114) {
+    if (op === CURSOR_OP) {
       // the client's own pointer packet IS the mouse position, in the same 16-bit form we send: read it
       // back so target choice follows what the player aims at. The bot sends through zx.orig, so this
       // only ever sees cursor packets, never our own steering.
