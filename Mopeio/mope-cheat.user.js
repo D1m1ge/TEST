@@ -107,8 +107,8 @@
     biteHeadDeg: 75,         // max nose-vs-tail heading error to treat as a committed bite
     biteReachFrac: 0.6,      // mouth-to-tail must be <= er * this (MODEL, not a confirmed hitbox)
     lungeHeadDeg: 60,        // heading error allowed to fire a finishing dart
-    lockMinHoldMs: 350,      // keep an attack target this long before switching (anti flip-flop)
-    lockSwitchRatio: 0.75,   // only switch early if the new candidate scores this fraction of the old
+    lockMinHoldMs: 140,      // keep an attack target this long before switching (anti flip-flop)
+    lockSwitchRatio: 0.6,   // only switch early if the new candidate scores this fraction of the old
     frontDangerFrac: 1.1,    // er * this = radius around the target's NOSE a dart path must not enter (MODEL)
     feintR: 2.8,             // switch from the approach to the close-in feint inside this many reaches
     approachGap: 1.1,        // UNCALIBRATED standoff ring the plain approach walks, in reaches: the cursor
