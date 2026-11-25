@@ -59,3 +59,31 @@ test('candidate limits predicted turn across angle wrap and falls back on stale 
   assert.equal(vm.runInContext('candidate.base.angle', context), -3.1);
   assert.equal(vm.runInContext('candidate.base.ageMs', context), null);
 });
+
+test('tactics: U loop alternates flanks, windback snaps back, clockwork orbits, boost gates', () => {
+  const me = origin, foe = { x: 100, y: 0 }, reach = 40;
+  const opts = { cycleMs: 900, turn: 1.9, holdMs: 420, backDeg: 150, lapMs: 620, ringR: 1.6,
+    every: 2, triggerR: 2.0, gapR: 2.2 };
+  const u0 = PVP.uMoonwalk(me, foe, reach, 0, opts);
+  const u1 = PVP.uMoonwalk(me, foe, reach, 450, opts);           // half a cycle later: other flank
+  assert.ok(u0.y !== u1.y && Math.sign(u0.y) !== Math.sign(u1.y));
+  assert.ok(Math.hypot(u0.x - me.x, u0.y - me.y) >= reach - 1e-6);
+  const wHold = PVP.windback(me, foe, reach, 100, opts);         // inside the hold window
+  const wBack = PVP.windback(me, foe, reach, 300, opts);         // past 60%: the snap-back
+  assert.equal(wHold.boost, false);
+  assert.equal(wBack.boost, true);
+  assert.ok(Math.abs(wBack.y) > Math.abs(wHold.y));
+  const c0 = PVP.clockwork(me, foe, reach, 0, opts);
+  const c1 = PVP.clockwork(me, foe, reach, 155, opts);           // quarter lap later
+  assert.ok(Math.abs(Math.hypot(c0.ring.x - foe.x, c0.ring.y - foe.y) - reach * 1.6) < 1e-6);
+  assert.ok(Math.abs(Math.hypot(c1.ring.x - foe.x, c1.ring.y - foe.y) - reach * 1.6) < 1e-6);
+  const near = PVP.defensiveBoost(me, { x: 70, y: 0 }, reach, 0, opts, 5);   // committed nose + closing
+  const far = PVP.defensiveBoost(me, foe, reach, 0, opts, 5);
+  assert.equal(near.boost, true);
+  assert.equal(far.boost, false);
+  const s0 = PVP.switchsideMoonwalk(me, foe, reach, 0, opts);
+  const s1 = PVP.switchsideMoonwalk(me, foe, reach, 2 * opts.holdMs, opts);  // after `every` cycles
+  assert.ok(Math.sign(s0.y) !== Math.sign(s1.y));
+  const b = PVP.bait(me, foe, reach, 0, opts);
+  assert.ok(Math.hypot(b.x - foe.x, b.y - foe.y) <= reach * opts.gapR + reach + 1e-6);
+});
