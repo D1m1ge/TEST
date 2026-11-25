@@ -34,7 +34,8 @@ if not exist "%BROWSER%" (
   exit /b 1
 )
 set "PROFILE=%TEMP%\mope-cdp-profile-%MOPE_CDP_PORT%"
-start "" "%BROWSER%" --remote-debugging-address=127.0.0.1 --remote-debugging-port=%MOPE_CDP_PORT% --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check --disable-session-crashed-bubble about:blank
+if not defined MOPE_URL set "MOPE_URL=https://mope.io/"
+start "" "%BROWSER%" --remote-debugging-address=127.0.0.1 --remote-debugging-port=%MOPE_CDP_PORT% --user-data-dir="%PROFILE%" --no-first-run --no-default-browser-check --disable-session-crashed-bubble "%MOPE_URL%"
 node "%~dp0inject.js"
 set "RESULT=%ERRORLEVEL%"
 if not "%RESULT%"=="0" pause

@@ -99,33 +99,52 @@ class CDP {
   }
 }
 
+function navError(text, game) {
+  if (/ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ERR_PROXY|ERR_TIMED_OUT|ERR_BLOCKED/i.test(text)) {
+    return new Error(
+      `Не удалось открыть ${game} (${text}). ` +
+      'Проверь интернет, а если сайт блокируется — запусти launcher через VPN.',
+    );
+  }
+  return new Error(`Navigation failed: ${text}`);
+}
+
+function sameOrigin(url, game) {
+  try { return new URL(url).origin === new URL(game).origin; } catch { return false; }
+}
+
+async function currentUrl(cdp, sessionId) {
+  const frame = await cdp.send('Runtime.evaluate', {
+    expression: 'location.href', returnByValue: true,
+  }, sessionId, 5000).catch(() => null);
+  return frame?.result?.value || '';
+}
+
 async function inject(cdp, source, game) {
-  const { targetId } = await cdp.send('Target.createTarget', { url: 'about:blank' });
-  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true });
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  let target = targetInfos?.find(t => t.type === 'page' && sameOrigin(t.url, game));
+  if (!target) {
+    const { targetId } = await cdp.send('Target.createTarget', { url: game });
+    target = { targetId };
+  }
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: target.targetId, flatten: true });
   await cdp.send('Page.enable', {}, sessionId);
   await cdp.send('Page.addScriptToEvaluateOnNewDocument', { source }, sessionId);
-  let lastError = 'unknown error';
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const result = await cdp.send('Page.navigate', { url: game }, sessionId, 20000);
-      if (result.errorText) {
-        const offline = /ERR_INTERNET_DISCONNECTED|ERR_NAME_NOT_RESOLVED|ERR_CONNECTION|ERR_PROXY|ERR_TIMED_OUT|ERR_BLOCKED/i.test(result.errorText);
-        if (offline) {
-          throw new Error(
-            `Не удалось открыть ${game} (${result.errorText}). ` +
-            'Проверь интернет, а если сайт блокируется — запусти launcher через VPN.',
-          );
-        }
-        throw new Error(`Navigation failed: ${result.errorText}`);
-      }
-      return targetId;
-    } catch (err) {
-      lastError = err.message;
-      if (/Не удалось открыть|Navigation failed/.test(lastError)) throw err;
+  const result = await cdp.send('Page.navigate', { url: game }, sessionId, 20000);
+  if (result.errorText) throw navError(result.errorText, game);
+  const deadline = Date.now() + 15000;
+  let url = '';
+  while (Date.now() < deadline) {
+    url = await currentUrl(cdp, sessionId);
+    if (sameOrigin(url, game)) return target.targetId;
+    if (!url || url === 'about:blank') {
+      await cdp.send('Runtime.evaluate', { expression: `location.href = ${JSON.stringify(game)}` }, sessionId, 5000).catch(() => {});
     }
-    if (attempt < 3) await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(resolve => setTimeout(resolve, 500));
   }
-  throw new Error(`Navigation failed: ${lastError}`);
+  throw new Error(
+    url ? `Вкладка осталась на ${url}, а не ${game}.` : `Не удалось открыть ${game}: вкладка не отвечает.`,
+  );
 }
 
 async function main() {

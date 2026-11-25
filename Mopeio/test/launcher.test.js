@@ -53,21 +53,39 @@ test('CDP cleans pending commands on reply, timeout, close and send failure', as
   await assert.rejects(badCdp.send('Fail'), /send failed/);
   assert.equal(badCdp.pending.size, 0);
 });
-test('inject registers full userscript before navigation and reports navigation errors', async () => {
+test('inject reuses the game tab, registers userscript before navigation and reports navigation errors', async () => {
   const ws = new Socket(), cdp = new CDP(ws);
   const methods = [];
   let fail = false;
   ws.send = data => {
     const m = JSON.parse(data); methods.push(m);
-    const result = m.method === 'Target.createTarget' ? { targetId: 'target' }
+    const result = m.method === 'Target.getTargets' ? { targetInfos: [] }
+      : m.method === 'Target.createTarget' ? { targetId: 'target' }
       : m.method === 'Target.attachToTarget' ? { sessionId: 'session' }
-      : m.method === 'Page.navigate' && fail ? { errorText: 'ERR_FAILED' } : {};
+      : m.method === 'Page.navigate' && fail ? { errorText: 'ERR_FAILED' }
+      : m.method === 'Runtime.evaluate' ? { result: { value: 'https://mope.io/' } }
+      : {};
     queueMicrotask(() => ws.emit('message', { data: JSON.stringify({ id: m.id, result }) }));
   };
   assert.equal(await inject(cdp, 'source', 'https://mope.io/'), 'target');
-  assert.deepEqual(methods.map(m => m.method), ['Target.createTarget', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate']);
-  assert.equal(methods[3].params.source, 'source');
-  assert.equal(methods[4].sessionId, 'session');
+  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.createTarget', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Runtime.evaluate']);
+  assert.equal(methods[4].params.source, 'source');
+  assert.equal(methods[5].sessionId, 'session');
   fail = true;
   await assert.rejects(inject(cdp, 'source', 'https://mope.io/'), /Navigation failed: ERR_FAILED/);
+});
+
+test('inject attaches to an already opened game tab without creating one', async () => {
+  const ws = new Socket(), cdp = new CDP(ws);
+  const methods = [];
+  ws.send = data => {
+    const m = JSON.parse(data); methods.push(m);
+    const result = m.method === 'Target.getTargets' ? { targetInfos: [{ targetId: 'game-tab', type: 'page', url: 'https://mope.io/' }] }
+      : m.method === 'Target.attachToTarget' ? { sessionId: 'session' }
+      : m.method === 'Runtime.evaluate' ? { result: { value: 'https://mope.io/' } }
+      : {};
+    queueMicrotask(() => ws.emit('message', { data: JSON.stringify({ id: m.id, result }) }));
+  };
+  assert.equal(await inject(cdp, 'source', 'https://mope.io/'), 'game-tab');
+  assert.deepEqual(methods.map(m => m.method), ['Target.getTargets', 'Target.attachToTarget', 'Page.enable', 'Page.addScriptToEvaluateOnNewDocument', 'Page.navigate', 'Runtime.evaluate']);
 });
