@@ -264,7 +264,22 @@
     //     the loader below only restores keys it finds in this object, so a missing slot silently throws
     //     away whatever the user bound to that row on the next reload.
     binds: { pvp: 'F1', dodge: 'F2', esp: 'F3', radar: 'F4', labels: 'F5',
-      ability: '', pick: 'F6', whip: 'F8', menu: 'Insert' },
+      ability: '', pick: 'F6', whip: 'F8', menu: 'Insert',
+      tactics: 'F7', tacticU: '', tacticWindback: '', tacticClock: '', tacticStraight: '',
+      tacticSwitch: '', tacticDefBoost: '', tacticBait: '' },
+    // --- TACTICS (from the guide video): one active at a time, on top of the phase engine.
+    //     'universal' = no override, the phase engine picks from geometry. Times are ms (UNCALIBRATED).
+    tactic: 'universal',
+    tacticUCycleMs: 900,     // U-moonwalk: one full left-to-right U loop
+    tacticUTurn: 1.9,        // rad of cursor swing per half-loop (the U's depth)
+    tacticWindbackMs: 420,   // windback: hold the bite line, then snap the cursor back this long
+    tacticWindbackDeg: 150,  // how far back the cursor swings on the windback
+    tacticClockR: 1.6,       // clockwork orbit radius, in reaches (constant angular speed)
+    tacticClockMs: 620,      // clockwork full-lap period
+    tacticStraightMs: 1200,  // straight-line moonwalk: retreat along the aim line this long, then re-check
+    tacticSwitchEvery: 2,    // switchside: change flanks after this many straight retreats
+    tacticDefBoostR: 2.0,    // defensive boost: fire when a foe nose is this close, in reaches
+    tacticBaitGap: 2.2,      // bait standoff ring, in reaches
   };
 
   // What the user ticked and which keys they bound survives a reload; the panel is the only writer.
@@ -408,7 +423,80 @@
       const positive = roots.filter(t => Number.isFinite(t) && t >= 0);
       return positive.length ? Math.min(maxSeconds, ...positive) : 0;
     }
-    return { clamp, wrapAngle, angleDelta, heading, offset, MotionTracker, evaluateAttack, TargetLock, interceptTime };
+
+    // ---- TACTICS (guide video). Each returns a cursor point in world units from our own nose
+    // ---- plus an optional boost request. Pure: no game state, all inputs explicit. `now` in ms.
+    // U Moonwalk (defense): cursor sweeps one deep U across the foe line -- approach on the right
+    // flank, swing the nose 180 through the foe's line, exit on the left, repeat.
+    function uMoonwalk(me, foe, reach, now, o) {
+      const t = (now % o.cycleMs) / o.cycleMs;            // 0..1 across the loop
+      const half = t < 0.5 ? 1 : -1;                      // right flank first, then the left one
+      const phase = t < 0.5 ? t * 2 : (t - 0.5) * 2;
+      const swing = o.turn * (0.35 + 0.65 * phase);       // ease into the U's depth, no snap start
+      const base = Math.atan2(foe.y - me.y, foe.x - me.x);
+      const a = base + half * swing;
+      const d = Math.max(reach, Math.hypot(foe.x - me.x, foe.y - me.y));
+      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: false };
+    }
+    // The windback (offense): hold the bite line for holdMs, then whip the cursor back behind our
+    // tail -- the client handbrakes and the nose snaps round onto the foe as he turns to follow.
+    function windback(me, foe, reach, now, o) {
+      const back = (now % o.holdMs) > o.holdMs * 0.6;
+      const base = Math.atan2(foe.y - me.y, foe.x - me.x);
+      const a = back ? base + Math.PI - o.backDeg * Math.PI / 180 * 0.5 : base;
+      const d = back ? reach * 2.2 : Math.max(reach, Math.hypot(foe.x - me.x, foe.y - me.y));
+      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: back };
+    }
+    // Clockwork (strategy): constant angular speed on a fixed ring around the foe, nose leaned inward.
+    // The cursor IS the ring point (measured from the foe), so the orbit radius never drifts with
+    // our own distance; the inward lean is a bounded extra pull, not a redefinition of the ring.
+    function clockwork(me, foe, reach, now, o) {
+      const t = (now % o.lapMs) / o.lapMs * Math.PI * 2;
+      const r = reach * o.ringR;
+      const px = foe.x + Math.cos(t) * r, py = foe.y + Math.sin(t) * r;
+      const dx = px - me.x, dy = py - me.y, l = Math.hypot(dx, dy) || 1;
+      const step = Math.min(l, l * 1.2);                       // full pull to the ring, slight overshoot bias
+      return { x: me.x + dx / l * step, y: me.y + dy / l * step, boost: false, ring: { x: px, y: py } };
+    }
+    // Straight-line moonwalk (defense): retreat nose-first along the away line with the cursor held
+    // behind us; straightR checks the escape line each cycle so the failsafe can pick it up outside.
+    function straightMoonwalk(me, foe, reach, now, o) {
+      const away = Math.atan2(me.y - foe.y, me.x - foe.x);
+      const side = (Math.floor(now / o.holdMs) % 2) ? 0.18 : -0.18;  // slight alternating bias: no same move twice
+      const a = away + side;
+      const d = reach * 2.6;
+      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: false };
+    }
+    // Switchside moonwalk: straight retreats that change flank every `every` cycles.
+    function switchsideMoonwalk(me, foe, reach, now, o) {
+      const cycle = Math.floor(now / o.holdMs);
+      const flank = (Math.floor(cycle / o.every) % 2) ? 1 : -1;
+      const away = Math.atan2(me.y - foe.y, me.x - foe.x) + flank * 0.5;
+      const d = reach * 2.6;
+      return { x: me.x + Math.cos(away) * d, y: me.y + Math.sin(away) * d, boost: false };
+    }
+    // Defensive boost (defense): hold the standoff ring, and when the foe's nose commits our way,
+    // boost along the escape arc -- never straight back (the client handbrakes).
+    function defensiveBoost(me, foe, reach, now, o, closing) {
+      const dist = Math.hypot(foe.x - me.x, foe.y - me.y);
+      const away = Math.atan2(me.y - foe.y, me.x - foe.x);
+      const fire = dist < reach * o.triggerR && (closing == null || closing > 0);
+      const a = fire ? away + 0.6 : away;
+      const d = Math.max(reach * 1.8, dist);
+      return { x: me.x + Math.cos(a) * d, y: me.y + Math.sin(a) * d, boost: fire };
+    }
+    // Bait: park on a wide ring the foe cannot ignore, then punish the commit (the bite engine runs
+    // underneath as soon as he turns his tail).
+    function bait(me, foe, reach, now, o) {
+      const t = (now % 1600) / 1600 * Math.PI * 2;
+      const r = reach * o.gapR;
+      const a = Math.atan2(me.y - foe.y, me.x - foe.x);
+      const px = foe.x + Math.cos(a + Math.sin(t) * 0.3) * r, py = foe.y + Math.sin(a + Math.sin(t) * 0.3) * r;
+      const dx = px - me.x, dy = py - me.y, l = Math.hypot(dx, dy) || 1;
+      return { x: me.x + dx / l * Math.min(l, reach), y: me.y + dy / l * Math.min(l, reach), boost: false };
+    }
+    return { clamp, wrapAngle, angleDelta, heading, offset, MotionTracker, evaluateAttack, TargetLock, interceptTime,
+      uMoonwalk, windback, clockwork, straightMoonwalk, switchsideMoonwalk, defensiveBoost, bait };
   })();
 
   // ------------------------------------------------------------ socket tap
@@ -1154,8 +1242,11 @@
     bot.diag = { base: B, tail: chosen.tail, geo };
 
     const res = M.Ac && M.Ac.resource;
-    const boostReady = CFG.lunge && (now - bot.lastDash >= CFG.dashCdMs) &&
-      (!res || res.max <= 0 || res.value >= CFG.dashMinRes * res.max);
+    // Guide rule 1 (conserve boosts): no finishing dart on a low tank, and rule 2 (be unpredictable):
+    // never re-dash on the same rhythm -- a small alternating phase jitter spreads the cadence.
+    const resBudget = !res || res.max <= 0 || res.value >= (CFG.dashMinRes + (bot.dashAlt ? 0.1 : 0)) * res.max;
+    const boostReady = CFG.lunge && (now - bot.lastDash >= CFG.dashCdMs * (bot.dashAlt ? 1.25 : 1)) && resBudget;
+    bot.dashAlt = !bot.dashAlt;
     // the hexagon darts must work even with the finishing-dart tuning off
     const whipReady = (now - bot.lastDash >= CFG.dashCdMs) &&
       (!res || res.max <= 0 || res.value >= CFG.dashMinRes * res.max);
@@ -1191,6 +1282,35 @@
       steer(M, me, s.x, s.y);
       if (CFG.dashDodge && now - bot.lastDodgeDash > 1200 && boost(M, me)) bot.lastDodgeDash = now;
       return;
+    }
+    // ---- TACTIC override: the selected guide move owns the frame, but the emergency pivot keeps its
+    // priority (a tactic is a plan, a body on our tail is an emergency). The cursor point comes from
+    // the pure PVP tactic functions; boost is the tactic's own request through the normal gate.
+    if (CFG.pvp && CFG.tactic !== 'universal' && !bot.snap) {
+      const T = CFG;
+      const f = { x: B.x, y: B.y };
+      const clos = closingRate(chosen.id, mx, my);
+      let r = null;
+      if (CFG.tactic === 'u') r = PVP.uMoonwalk({ x: mx, y: my }, f, reach, now,
+        { cycleMs: T.tacticUCycleMs, turn: T.tacticUTurn });
+      else if (CFG.tactic === 'windback') r = PVP.windback({ x: mx, y: my }, f, reach, now,
+        { holdMs: T.tacticWindbackMs, backDeg: T.tacticWindbackDeg });
+      else if (CFG.tactic === 'clockwork') r = PVP.clockwork({ x: mx, y: my }, f, reach, now,
+        { lapMs: T.tacticClockMs, ringR: T.tacticClockR });
+      else if (CFG.tactic === 'straight') r = PVP.straightMoonwalk({ x: mx, y: my }, f, reach, now,
+        { holdMs: T.tacticStraightMs });
+      else if (CFG.tactic === 'switchside') r = PVP.switchsideMoonwalk({ x: mx, y: my }, f, reach, now,
+        { holdMs: T.tacticStraightMs, every: T.tacticSwitchEvery });
+      else if (CFG.tactic === 'defboost') r = PVP.defensiveBoost({ x: mx, y: my }, f, reach, now,
+        { triggerR: T.tacticDefBoostR }, clos);
+      else if (CFG.tactic === 'bait') r = PVP.bait({ x: mx, y: my }, f, reach, now,
+        { gapR: T.tacticBaitGap });
+      if (r) {
+        bot.mode = 'tactic:' + CFG.tactic;
+        steer(M, me, r.x, r.y, r.boost && boostReady ? { lap: bot.whipLap, target: bot.target } : null);
+        if (r.boost && boostReady) { boost(M, me); bot.lastDash = now; }
+        return;
+      }
     }
     if (CFG.whip && !bot.snap && now > bot.dashSeenUntil) {
       bot.mode = 'whip';
@@ -1588,6 +1708,76 @@
     row.addEventListener('mouseleave', () => { descBox.textContent = ''; });
   }
 
+  // ---- PvP tactics page: guide-video moves as one-active-at-a-time buttons. 'universal' hands the
+  // frame back to the phase engine; a named tactic owns the cursor until switched off or replaced.
+  const TACTIC_ROWS = [
+    ['universal', 'Универсальное ПвП', 'Базовый режим: фазовый движок сам выбирает поведение по геометрии (уклон, тряска, деф, вихрь, байт, укус, рывок) и соблюдает правила из гайда — беречь буст, не повторять одно и то же движение, не лезть за стену арены.'],
+    ['u', 'U Moonwalk (деф)', 'Дуга «U»: заход одним бортом, разворот носа на 180° через линию противника, выход другим бортом, повтор. Курсор ведётся плавно, без рывков; при срыве противника в погоню петля не дожимается — разворот лицом.'],
+    ['windback', 'Windback (атака)', 'Держим линию укуса, затем резкий откат курсора назад: противник, разворачиваясь в ответ, подставляет хвост второй раз. Рывок в момент отката.'],
+    ['clockwork', 'Clockwork (стратегия)', 'Равномерное вращение по кругу вокруг противника с постоянной угловой скоростью, нос чуть внутрь круга. Изматывание и выживание в зоне; буст не тратится. Выход в укус, когда противник потерял позицию.'],
+    ['straight', 'Straight Line Moonwalk (деф)', 'Отход по прямой «лунной походкой»: курсор за спиной, тело пятится. Если прямая ведёт в стену или красный круг — переключиться на U-петлю (Failsafe), не меняя ритма.'],
+    ['switchside', 'Switchside Moonwalk (деф)', 'Тот же отход, но со сменой борта каждые несколько циклов: противник не может предсказать, с какой стороны заходить.'],
+    ['defboost', 'Defensive Boost (деф)', 'Рывок не от противника, а по дуге 60–90° в сторону от траектории его носа, с сохранением дистанции. Тратится только когда нос противника уже смотрит на нас.'],
+    ['bait', 'Байт (приманка)', 'Держим широкий кольцо-стойку, которое враг не может игнорировать; как только он разворачивает хвост — подключается движок укуса и наказывает.'],
+  ];
+  const TACTIC_LABEL = { universal: 'Универсальное ПвП', u: 'U Moonwalk', windback: 'Windback',
+    clockwork: 'Clockwork', straight: 'Straight Line', switchside: 'Switchside',
+    defboost: 'Defensive Boost', bait: 'Байт' };
+
+  const tacticsPage = document.createElement('div');
+  tacticsPage.style.display = 'none';
+  for (const [key, name, desc] of TACTIC_ROWS) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex;align-items:center;gap:5px;padding:1px 0';
+    const rb = document.createElement('input');
+    rb.type = 'radio'; rb.name = 'mopeTactic'; rb.checked = CFG.tactic === key;
+    rb.addEventListener('change', () => { if (rb.checked) { CFG.tactic = key; saveCfg(); } });
+    const txt = document.createElement('span');
+    txt.textContent = name;
+    txt.style.cssText = 'flex:1;cursor:pointer';
+    txt.title = desc;
+    const chipKey = 'tactic' + key.charAt(0).toUpperCase() + key.slice(1);
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.dataset.bind = chipKey;
+    chip.title = 'Клавиша включить тактику — нажми и задай новую';
+    chip.style.cssText = chipStyle;
+    chip.addEventListener('click', () => armBind(chipKey, chip));
+    row.append(rb, txt, chip);
+    row.addEventListener('mouseenter', () => { descBox.textContent = desc; });
+    row.addEventListener('mouseleave', () => { descBox.textContent = ''; });
+    tacticsPage.appendChild(row);
+    bindChips[chipKey] = chip;
+  }
+  const TACTIC_KEYS = TACTIC_ROWS.map(r => r[0]);
+  function setTactic(key) {
+    if (!TACTIC_KEYS.includes(key)) return;
+    CFG.tactic = key; saveCfg();
+    const radios = tacticsPage.querySelectorAll('input[type=radio]');
+    radios.forEach((rb, i) => { rb.checked = TACTIC_KEYS[i] === key; });
+    say('тактика: ' + (TACTIC_LABEL[key] || key));
+  }
+  window.__MOPE_SET_TACTIC = setTactic;      // test-rig + bind hook
+  window.__MOPE_GET_TACTIC = () => CFG.tactic;
+
+  const pages = document.createElement('div');
+  pages.style.cssText = 'display:flex;gap:4px;margin:2px 0';
+  const tabPageBtns = [];
+  function showPage(n) {
+    rowsBox.style.display = n === 0 ? 'block' : 'none';
+    tacticsPage.style.display = n === 1 ? 'block' : 'none';
+    tabPageBtns.forEach((b, i) => { b.style.color = i === n ? '#7fd7ff' : '#e6edf3'; b.style.borderColor = i === n ? '#7fd7ff' : '#3a4350'; });
+  }
+  ['Функции', 'Функции PvP'].forEach((label, n) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.style.cssText = 'flex:1;background:rgba(30,36,44,0.7);color:#e6edf3;border:1px solid #3a4350;border-radius:3px;font:10px monospace;padding:2px 4px;cursor:pointer;text-shadow:none';
+    b.addEventListener('click', () => showPage(n));
+    pages.appendChild(b);
+    tabPageBtns.push(b);
+  });
+
   // ---- click-to-target. mope.io steers with the mouse and boosts with a held left button, so a click
   // may only be read as "this one" while the pick is ARMED (button or its bind): otherwise every boost
   // press would re-target. The chosen animal then beats both the arena opponent and the scoring.
@@ -1808,7 +1998,7 @@
   closeBtn.addEventListener('pointerdown', e => e.stopPropagation());
   closeBtn.addEventListener('click', () => { CFG.showMenu = false; syncMenu(); saveCfg(); });
   title.append(titleText, closeBtn);
-  panel.append(title, rowsBox, descBox, skinRow, status, hint);
+  panel.append(title, pages, rowsBox, tacticsPage, descBox, skinRow, status, hint);
 
   const openBtn = document.createElement('div');
   openBtn.id = 'mopeCheatOpen';
@@ -1830,6 +2020,7 @@
     openBtn.style.display = CFG.showMenu ? 'none' : 'block';
   }
   syncMenu();
+  showPage(0);
 
   function mountUI() {
     // mope.io rewrites <html> during bootstrap, which drops anything appended at document-start.
@@ -1901,6 +2092,16 @@
     e.stopImmediatePropagation();
     if (action === 'pick') armPick();                       // an action, not a switch: it waits for one click
     else if (action === 'menu') CFG.showMenu = !CFG.showMenu;
+    else if (action.startsWith('tactic') && action !== 'tactics') {
+      const key = action === 'tacticU' ? 'u'
+        : action === 'tacticWindback' ? 'windback'
+        : action === 'tacticClock' ? 'clockwork'
+        : action === 'tacticStraight' ? 'straight'
+        : action === 'tacticSwitch' ? 'switchside'
+        : action === 'tacticDefBoost' ? 'defboost'
+        : action === 'tacticBait' ? 'bait' : null;
+      if (key) setTactic(CFG.tactic === key ? 'universal' : key);   // same key again -> back to universal
+    }
     else CFG[action] = !CFG[action];
     syncMenu();
     saveCfg();
