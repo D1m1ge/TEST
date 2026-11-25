@@ -1,0 +1,929 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>harness</title>
+<!-- document-start stand-in: the real userscript, loaded before anything else on the page -->
+<script src="../mope-cheat.user.js"></script>
+</head>
+<body>
+<script>
+'use strict';
+// Test stand for mope-cheat.user.js. Nothing here touches mope.io servers.
+// What is modelled on the production bundle (c/D8bNReW2.js): iframe realm capture, the 205
+// handler, network client zx, the 4ms cursor loop and its uA() pacing, entity class chain,
+// camera tq(). What is a MODEL (assumption, not from the bundle): server movement, boost
+// cost/length, circle collision at equal tier, bite = nose within half a radius of the tail.
+const H = window.H = { errors: [], wire: [], bites: 0, deaths: 0, minDist: {}, pointerMode: 'still', t0: 0, focus: null, ptrace: [], touch: [] };
+window.addEventListener('error', e => H.errors.push(String(e.message)));
+window.addEventListener('unhandledrejection', e => H.errors.push('rejection: ' + String(e.reason)));
+
+// Virtual clock. H.step() drives the whole model deterministically without relying on wall-clock
+// timers, which a backgrounded/automated tab throttles to ~1 Hz (and pauses rAF). Null = live mode,
+// real performance.now(). The userscript calls performance.now() live, so it follows this too.
+const perfNow = performance.now.bind(performance);
+let VIRT = null;
+performance.now = () => (VIRT != null ? VIRT : perfNow());
+
+// ---------- realm capture, same shape as the bundle
+const fr = document.createElement('iframe');
+fr.hidden = true; fr.setAttribute('aria-hidden', 'true'); fr.tabIndex = -1;
+document.documentElement.appendChild(fr);
+const ke = fr.contentWindow;
+const capturedSend = ke.WebSocket.prototype.send;
+const capturedAdd = ke.EventTarget.prototype.addEventListener;
+H.realmCapturedPatched = !/\[native code\]/.test(String(capturedSend)) && !/\[native code\]/.test(String(capturedAdd));
+
+// the client's socket wrapper: adds its message handler through the captured addEventListener,
+// then feeds every frame to the control dispatcher. Real WebSocket object (the local server
+// refuses the upgrade; the connection itself is never used).
+const sock = new ke.WebSocket('ws://127.0.0.1:8793/ws');
+capturedAdd.call(sock, 'message', e => { if (e.isTrusted) onMessage(e); });
+function onMessage(e) {
+  const bytes = new Uint8Array(e.data), op = bytes[0];
+  if (op !== 205) return;
+  const len = bytes[1] | bytes[2] << 8;                 // Ic.readString(): u16 LE length + utf8
+  const src = new TextDecoder().decode(bytes.subarray(3, 3 + len));
+  try { Function('Game', src)(game); } catch (err) { H.errors.push('205: ' + err); }
+}
+
+// ---------- the bundle's vector + entity chain
+class Ks {
+  constructor(x = 0, y = 0) { this.x = x; this.y = y; }
+  set(x, y) { if (typeof x === 'object') { this.x = x.x; this.y = x.y; } else { this.x = x; this.y = y; } return this; }
+  subtract(o) { this.x -= o.x; this.y -= o.y; return this; }
+  rotate(t) { const r = this.x, i = this.y, a = Math.cos(t), o = Math.sin(t); this.x = r * a - i * o; this.y = r * o + i * a; return this; }
+}
+class Xv {
+  static type = 'entity';
+  constructor() {
+    this.id = 0; this.type = this.constructor.type; this.spawned = true; this.species = ''; this.tier = 0; this.hole = null;
+    this.size = new Ks(60, 60); this.position = new Ks();
+    this.target = { position: new Ks(), angle: 0, size: this.size, health: 100 };
+    this.name = { text: '' };
+    // bundle truth: the animal texture path (get Ag -> zg(animalConfig, subspecies)) reads
+    // animalConfig.subspeciesEnum, NOT the entity's own subspeciesEnum field. Model that.
+    this.animalConfig = { subspeciesEnum: this.constructor.subspeciesEnum || null };
+    this.subspeciesEnum = null;
+  }
+  // texture loader in the real bundle; the skin pin re-runs it when the id changes -> observable in tests
+  init() { H.initCalls = (H.initCalls || 0) + 1; return Promise.resolve(); }
+  Qn(e) {
+    if (e && e.reader) {
+      this.species = e.species; this.id = e.id;
+      this.position.set(e.x, e.y); this.target.position.set(e.x, e.y);
+      this.size.set(e.size, e.size); this.target.size.set(e.size, e.size);
+    }
+    return this;
+  }
+  synchronize(e) {
+    if (e && e.reader) {                    // what the real decoder leaves behind
+      this.target.position.set(e.px, e.py);
+      this.$q = performance.now();
+    }
+    return this;
+  }
+  destroy() { this.spawned = false; return this; }
+}
+class Animal extends Xv {
+  static type = 'animal';
+  Qn(e) { super.Qn(e); if (e && e.reader) { this.tier = e.tier; this.name.text = e.name || ''; } return this; }
+  synchronize(e) { super.synchronize(e); if (e && e.reader) this.target.angle = e.angle; return this; }
+}
+class Mouse extends Animal {}
+// TS-style reverse enum, exactly the shape of the bundle's subspeciesEnum: numeric id -> NAME and
+// NAME -> id both present, so Object.keys has both and the skin <select> must show the numeric ones.
+Mouse.subspeciesEnum = (() => { const e = {}; e[e.DEFAULT = 0] = 'DEFAULT'; e[e.WINTER = 1] = 'WINTER'; e[e.SPRING = 2] = 'SPRING'; e[e.SUMMER = 3] = 'SUMMER'; return e; })();
+class Rabbit extends Animal {}
+class Bear extends Animal {}
+class Berry extends Xv { static type = 'food'; }
+
+// ---------- game singleton $
+const MAX = { x: 14000, y: 14000 };
+const cam = {
+  position: new Ks(7000, 7000), target: { position: new Ks(7000, 7000), angle: 0 }, angle: 0, zoom: 0.6,
+  // the real game canvas fills the viewport at devicePixelRatio; mirror that so tq/k geometry matches
+  canvas: (() => {
+    const dpr = window.devicePixelRatio || 1;
+    return {
+      get width() { return Math.round(window.innerWidth * dpr); },
+      get height() { return Math.round(window.innerHeight * dpr); },
+      get clientWidth() { return window.innerWidth; },
+      get clientHeight() { return window.innerHeight; },
+    };
+  })(),
+  tq(x, y) { const n = new Ks(x, y).subtract(this.position).rotate(this.angle); return new Ks(this.canvas.width / 2 + n.x * this.zoom, this.canvas.height / 2 + n.y * this.zoom); },
+  Bx(x, y) { const n = new Ks((x - this.canvas.width / 2) / this.zoom, (y - this.canvas.height / 2) / this.zoom).rotate(-this.angle); n.x += this.position.x; n.y += this.position.y; return n; },
+};
+const sim = { ents: new Map(), target: null, boost: false, resource: 100, nextId: 100 };
+const net = {
+  readyState: 'closed',
+  zx(op, payload, flag) {
+    if (this.readyState !== 'open') return this;
+    // client-origin packets are flagged by the input loop; the bot calls zx.orig directly
+    const fromClient = !!net._clientSend;
+    H.wire.push({ t: performance.now(), op, payload: payload ? { Jb: payload.Jb, zd: payload.zd } : null, fromClient });
+    if (op === 114) sim.target = { x: payload.Jb / 65535 * MAX.x, y: payload.zd / 65535 * MAX.y };
+    if (op === 192 && sim.resource >= 25) { sim.resource -= 25; player.boostUntil = performance.now() + 600; }
+    return this;
+  },
+};
+const game = {
+  zy: null, $r: 0, oB: false, fw: { bounds: { max: MAX } }, Hf: net, Ar: cam,
+  Yw: { maxEventRate: 120 }, Ac: { resource: { value: 100, max: 100 } },
+  zt: { animals: { 0: Mouse, 1: Rabbit, 15: Bear }, foods: { 0: Berry } },
+};
+
+// ---------- client cursor loop: 4ms timer, paced like uA()
+const input = { Hc: 0, Zq: 0, xv: 0, pointer: { x: 800, y: 450 } };
+const uA = () => { const e = game.zy; return !e || e.arena || e.tier >= 15 ? game.Yw.maxEventRate : e.tier >= 10 ? 60 : 30; };
+const toPrec = (v, max) => Math.round(Math.max(0, Math.min(max, v)) / max * 65535);
+function inputStep() {
+  const now = performance.now();
+  if (game.oB || !game.zy || now < input.Hc - 1) return;
+  if (H.pointerMode === 'drift') { const dt = VIRT != null ? H.simT : now; input.pointer.x = 800 + 150 * Math.sin(dt / 400); }
+  const p = cam.Bx(input.pointer.x, input.pointer.y);
+  const a = toPrec(p.x, MAX.x), b = toPrec(p.y, MAX.y);
+  if (a !== input.Zq || b !== input.xv) { input.Zq = a; input.xv = b; net._clientSend = true; try { game.Hf.zx(114, { Jb: a, zd: b }); } finally { net._clientSend = false; } }
+  const iv = 1000 / uA();
+  input.Hc = Math.max(input.Hc, now - iv) + iv;
+}
+setInterval(inputStep, 4);
+
+// ---------- model server: 20 Hz
+let player = null;
+function spawn(o) {
+  const ce = new o.cls();
+  ce.Qn({ reader: true, id: sim.nextId++, species: o.species || '', tier: o.tier ?? 1, name: o.name || '', x: o.x, y: o.y, size: o.r * 2 });
+  const s = { ce, x: o.x, y: o.y, angle: o.angle || 0, r: o.r, tier: o.tier ?? 1, speed: o.speed ?? Math.hypot(o.vx || 0, o.vy || 0), vx: o.vx || 0, vy: o.vy || 0, homing: !!o.homing, isPlayer: !!o.isPlayer, lastBite: 0, boostUntil: 0, kite: !!o.kite, kiteOff: o.kiteOff || 0 };
+  if (o.boosting) ce.status = { boosting: true };   // bundle truth: animals carry status.boosting
+  if (o.arena) ce.arena = o.arena;   // bundle truth: the arena entity stamps .arena on both players
+  sim.ents.set(ce.id, s);
+  return s;
+}
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+const wrap = a => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+
+// The wall-clock setInterval below still fires while H.step owns the virtual clock. Without this
+// watermark the model would take extra 50ms steps at a FROZEN virtual time, so scenario outcomes
+// would depend on how fast the machine runs -- which is what silently collapsed S3 after S2 grew.
+let simWater = -1e9;
+function simStep() {
+  if (VIRT != null) { if (VIRT - simWater < 50) return; simWater = VIRT; }
+  const now = performance.now(), dt = 0.05;
+  sim.resource = Math.min(100, sim.resource + 10 * dt);
+  for (const s of sim.ents.values()) {
+    let speed, desired;
+    if (s.isPlayer) {
+      speed = 240 * (now < s.boostUntil ? 2.4 : 1);
+      desired = sim.target ? Math.atan2(sim.target.y - s.y, sim.target.x - s.x) : s.angle;
+    } else {
+      speed = s.kite ? 0 : s.speed;
+      // kiteOff lets the nose sit off-axis while the body still slides back: a foe that faces us
+      // EXACTLY can never be bitten by anyone (its tail is always on the far side), so a control run
+      // needs a realistic partial face to show what the bait branch really refuses.
+      desired = s.kite ? Math.atan2(player.y - s.y, player.x - s.x) + s.kiteOff
+        : s.homing ? Math.atan2(player.y - s.y, player.x - s.x)
+        : (s.vx || s.vy) ? Math.atan2(s.vy, s.vx) : s.angle;
+    }
+    // clamp(diff, -rate, +rate). The previous Math.max(diff, -r, Math.min(r, diff)) returned diff itself
+    // for every diff > +rate, so entities turned instantly clockwise and only obeyed the limit the
+    // other way -- which made every aim metric depend on which way the turn happened to go.
+    const diff = wrap(desired - s.angle), turn = Math.min(4 * dt, Math.max(-4 * dt, diff));
+    s.angle = wrap(s.angle + turn);
+    s.x = Math.max(s.r, Math.min(MAX.x - s.r, s.x + Math.cos(s.angle) * speed * (0.35 + 0.65 * Math.max(0, Math.cos(diff))) * dt));
+    s.y = Math.max(s.r, Math.min(MAX.y - s.r, s.y + Math.sin(s.angle) * speed * (0.35 + 0.65 * Math.max(0, Math.cos(diff))) * dt));
+    // kiting foe: nose stays on us while the body slides directly away -- the pattern that makes a
+    // committed dart walk into the turn. Movement is decoupled from the nose, exactly like a real
+    // player holding the mouse behind them.
+    if (s.kite) {
+      const kx = s.x - player.x, ky = s.y - player.y, kl = Math.hypot(kx, ky) || 1;
+      s.x = Math.max(s.r, Math.min(MAX.x - s.r, s.x + kx / kl * s.speed * dt));
+      s.y = Math.max(s.r, Math.min(MAX.y - s.r, s.y + ky / kl * s.speed * dt));
+    }
+  }
+  // every sample carries the ring size AT THAT MOMENT: the duel circle shrinks during a fight, so a
+  // distance compared against the starting radius would prove nothing.
+  const rg = ringGeo(player && player.ce.arena);
+  if (rg) H.ptrace.push({ d: Math.round(Math.hypot(player.x - rg.c.x, player.y - rg.c.y)), R: Math.round(rg.R), D: rg.D });
+  for (const s of sim.ents.values()) {
+    if (s === player) continue;
+    const d = dist(s, player);
+    H.minDist[s.ce.id] = Math.min(H.minDist[s.ce.id] ?? Infinity, d);
+    // The push below rewrites the position, so a distance sampled AFTER it can never show a body
+    // inside a body -- which is precisely the thing that had to be measured. Record the pre-push overlap,
+    // tagged with the mode that asked for it, so "runs into the model" has a number.
+    if (s.ce.id === H.focus && s.tier === player.tier && d > 0 && d < s.r + player.r) {
+      let tm = null; try { tm = typeof window.__MOPE_MODE === 'function' ? window.__MOPE_MODE() : null; } catch (e) { tm = null; }
+      // WHOSE overlap is it? The model moves along its OWN heading, so a body whose nose points more than
+      // 90 deg away from the foe cannot be driving into him -- that contact is his charge, and no orbit can
+      // refuse it. Splitting the two is what makes "never enters her model" a claim about the bot instead of
+      // a claim about who happened to be accelerating that tick.
+      const away = Math.abs(wrap(Math.atan2(s.y - player.y, s.x - player.x) - player.angle)) > Math.PI / 2;
+      H.touch.push({ v: now, d: Math.round(d), need: Math.round(s.r + player.r), mode: tm, away: away });
+    }
+    if (s.tier === player.tier && d < s.r + player.r && d > 0) {        // equal tier: solid circles
+      const push = (s.r + player.r - d);
+      player.x += (player.x - s.x) / d * push; player.y += (player.y - s.y) / d * push;
+    }
+    const tailX = s.x - Math.cos(s.angle) * s.r * 0.93, tailY = s.y - Math.sin(s.angle) * s.r * 0.93;
+    const noseX = player.x + Math.cos(player.angle) * player.r, noseY = player.y + Math.sin(player.angle) * player.r;
+    if (s.tier <= player.tier && Math.hypot(noseX - tailX, noseY - tailY) < s.r * 0.5 && now - s.lastBite > 500) { s.lastBite = now; H.bites++; }
+    if (s.tier > player.tier && d < (s.r + player.r) * 0.6) H.deaths++;
+  }
+  // snapshot: what opcode 25 does to each entity
+  for (const s of sim.ents.values()) {
+    if (!s.ce.spawned) continue;
+    s.ce.target.position.set(s.x, s.y); s.ce.target.angle = s.angle;
+    s.ce.synchronize({ reader: true, px: s.x, py: s.y, angle: s.angle });
+  }
+  game.Ac.resource.value = sim.resource;
+}
+setInterval(simStep, 50);
+
+function frame() {
+  requestAnimationFrame(frame);
+  if (!player) return;
+  cam.position.x += (player.ce.position.x - cam.position.x) * 0.15;
+  cam.position.y += (player.ce.position.y - cam.position.y) * 0.15;
+  for (const s of sim.ents.values()) {
+    s.ce.position.x += (s.ce.target.position.x - s.ce.position.x) * 0.25;
+    s.ce.position.y += (s.ce.target.position.y - s.ce.position.y) * 0.25;
+  }
+}
+requestAnimationFrame(frame);
+
+// ---------- scenarios
+function reset(o = {}) {
+  for (const s of sim.ents.values()) s.ce.destroy();
+  sim.ents.clear(); sim.target = null; sim.resource = 100;
+  H.wire.length = 0; H.bites = 0; H.deaths = 0; H.minDist = {}; H.focus = null; H.focusStart = null;
+  H.ptrace.length = 0;   // how far out of the duel ring our own body ever got
+  H.faceLog = []; H.touch = []; H.wheelLog = []; H.pend = null; H.initCalls = 0; H.simT = 0;   // scenario-relative clock for anything that must not depend on wall time
+  H.pointerMode = o.pointer || 'still';
+  // the client cursor loop keeps its own memory; without this the pointer (and the paced last-sent
+  // pair) leaks from a previous scenario, so the world the next scenario sees depends on run order.
+  input.pointer = { x: 800, y: 450 };
+  input.Hc = 0; input.Zq = input.xv = -1;
+  player = spawn({ cls: Mouse, tier: 1, r: 40, x: 7000, y: 7000, angle: 0, isPlayer: true });
+  player.angle = o.angle || 0;
+  game.zy = player.ce; game.$r = player.ce.id;
+  cam.position.set(7000, 7000);
+  H.t0 = performance.now();
+}
+function put(cls, tier, r, dx, dy, angle, extra = {}) {
+  const s = spawn({ cls, tier, r, x: player.x + dx, y: player.y + dy, angle, ...extra });
+  H.focus = s.ce.id; H.focusStart = { x: s.x, y: s.y };
+  return s;
+}
+const press = code => window.dispatchEvent(new KeyboardEvent('keydown', { code }));
+const predator = () => put(Bear, 2, 55, 480, 0, Math.PI, { homing: true, speed: 260 });
+
+// The challenge arena, modelled the way the bundle builds it: an object holding the two animal
+// entities in player1/player2, with .arena stamped on both of them (Qn() does exactly that).
+// Geometry is bundle truth too: the ring is a CIRCLE of diameter size.x and the client draws its wall
+// at (size.x - wallThickness)/2 -- that is the radius the bot has to stay inside.
+function mkArena(a, b, diameter, center, opts = {}) {
+  const D = diameter || 2400;
+  const geo = {
+    position: center ? new Ks(center.x, center.y) : new Ks((a.x + b.x) / 2, (a.y + b.y) / 2),
+    size: new Ks(D, D), wallThickness: opts.wall != null ? opts.wall : 40
+  };
+  // The client keeps every field twice: the entity and its networked .target. opts.viaTarget pins the
+  // ring data to the .target side only, which is the shape the live bundle actually ends up using, so a
+  // bot that reads one place by luck fails here instead of passing a fiction.
+  const A = opts.viaTarget ? { player1: a.ce, player2: b.ce, target: geo }
+                           : Object.assign({ player1: a.ce, player2: b.ce }, geo);
+  a.ce.arena = A; b.ce.arena = A;
+  H.ring = A;
+  return A;
+}
+// the ring the userscript should be reading, mirrored here so the test measures against the CURRENT
+// circle (it shrinks during a duel) rather than the one that existed when the scenario started.
+function ringGeo(A) {
+  if (!A) return null;
+  const c = A.position || (A.target && A.target.position);
+  const g = A.size || (A.target && A.target.size);
+  if (!c || !g) return null;
+  const w = Number.isFinite(A.wallThickness) ? A.wallThickness
+    : Number.isFinite(A.target && A.target.wallThickness) ? A.target.wallThickness : 0;
+  return { c, R: (g.x - w) / 2, D: g.x };
+}
+// A real click on the game field at an animal's DRAWN position: this is the only way to drive the
+// userscript's hit test, so the pick is tested through the same event path the player uses. The product
+// picks on the RELEASE of a short, still left press (a long hold stays the game's own boost) and on the
+// right button outright, so both paths are dispatched here exactly like a browser would.
+function downXY(x, y, button = 0) {
+  window.dispatchEvent(new MouseEvent('mousedown', { clientX: x, clientY: y, button, bubbles: true }));
+}
+function upXY(x, y, button = 0) {
+  window.dispatchEvent(new MouseEvent('mouseup', { clientX: x, clientY: y, button, bubbles: true }));
+}
+function clickXY(x, y, button = 0) {
+  downXY(x, y, button);
+  if (button === 2) window.dispatchEvent(new MouseEvent('contextmenu', { clientX: x, clientY: y, button: 2, bubbles: true }));
+  else upXY(x, y, 0);
+  return { x: Math.round(x), y: Math.round(y) };
+}
+function clickAt(ce, button = 0) {
+  const s = cam.tq(ce.position.x, ce.position.y), k = cam.canvas.width / cam.canvas.clientWidth || 1;
+  return clickXY(s.x / k, s.y / k, button);
+}
+const armPick = () => { if (typeof window.__MOPE_ARM_PICK === 'function') window.__MOPE_ARM_PICK(); };
+
+// Panel switches, in the userscript's ROWS order. Driving them via a 'change' event is the only config
+// path the userscript honours that we can set absolutely (press() toggles, which made every scenario
+// depend on whatever the previous one left in CFG). autoDuel / retaliate are NOT rows any more: they are
+// internal tie-breakers of the fallback picker, so the rig drives them through __MOPE_CFG instead.
+const CFG_KEYS = ['pvp', 'dodge', 'esp', 'radar', 'labels', 'ability', 'whip'];
+const EXTRA_KEYS = ['autoDuel', 'retaliate'];
+const CFG_DEFAULT = { pvp: true, dodge: true, autoDuel: true, retaliate: true, esp: true, radar: true, labels: true, ability: false, whip: false };
+// PvP phases and the target-scoring weights are no longer menu switches (one PvP button drives the whole
+// system), so the rig sets the internal flags through __MOPE_CFG. Every key a scenario may touch is listed
+// here and re-applied in full on every start -- nothing may leak between scenarios.
+const TUNE_FALLBACK = { pvpFast: true, lunge: true, diamond: true, tierWeight: 400, cursorWeight: 0.5 };
+const TUNE_DEFAULT = (typeof window.__MOPE_TUNE_DEFAULTS === 'function' && window.__MOPE_TUNE_DEFAULTS()) || TUNE_FALLBACK;
+function setCfg(patch = {}) {
+  const cbs = document.querySelectorAll('#mopeCheatPanel input[type=checkbox]');
+  CFG_KEYS.forEach((k, i) => {
+    const want = k in patch ? patch[k] : CFG_DEFAULT[k];
+    if (cbs[i] && cbs[i].checked !== want) {
+      cbs[i].checked = want;
+      cbs[i].dispatchEvent(new Event('change'));
+    }
+  });
+  const extra = {};
+  for (const k of EXTRA_KEYS) extra[k] = k in patch ? patch[k] : CFG_DEFAULT[k];
+  if (typeof window.__MOPE_CFG === 'function') window.__MOPE_CFG(extra);
+}
+
+// name -> set up the world, then return the exact features that scenario runs with.
+// Must use a block body: an arrow with a comma expression returns the last operand, not the cfg.
+const SCEN = {
+  S0_manual:      () => { reset({ pointer: 'drift' }); return { cfg: { pvp: false, dodge: false } }; },
+  S1_bite_still:  () => { reset(); put(Rabbit, 1, 40, 600, 0, 0); return { cfg: { dodge: false } }; },
+  S2_bite_moving: () => { reset(); put(Rabbit, 1, 40, 500, 0, 0, { vx: 120, vy: 0 }); return { cfg: { dodge: false } }; },
+  S3_guard:       () => { reset({ angle: 0 }); put(Rabbit, 1, 40, -90, 0, 0); return { cfg: { pvp: false, dodge: true } }; },
+  S4_evade_on:    () => { reset(); predator(); return { cfg: { pvp: false, dodge: true } }; },
+  S4_evade_off:   () => { reset(); predator(); return { cfg: { pvp: false, dodge: false } }; },
+  S5_purge:       () => { reset(); put(Rabbit, 1, 40, 500, 0, 0).ce.destroy(); return { cfg: { dodge: true } }; },
+  S6_esp:         () => { reset(); put(Rabbit, 1, 40, 300, 0, 0); spawn({ cls: Berry, r: 10, x: 6500, y: 6500 }); return { cfg: { pvp: false, dodge: false, esp: true } }; },
+  S7_idle_on:     () => { reset({ pointer: 'drift' }); return { cfg: { dodge: false } }; },
+  // the full system on a foe that squares up at us: expect the close feint + boosts, never our back
+  S8_diamond:     () => { reset(); put(Rabbit, 1, 40, 400, 0, Math.PI); return { cfg: { dodge: false } }; },
+  // isolated PvP phases for the verifier
+  S9_face:        () => { reset(); put(Rabbit, 1, 40, 400, 0, Math.PI); return { cfg: { dodge: false }, tune: { diamond: false, pvpFast: false, lunge: false } }; },
+  S10_fast:       () => { reset(); put(Rabbit, 1, 40, 400, 0, Math.PI); return { cfg: { dodge: false }, tune: { diamond: false, pvpFast: true, lunge: true } }; },
+  // dart: a foe crossing broadside close to us -- tail exposed, path to it clear of its nose
+  S11_lunge:      () => { reset(); put(Rabbit, 1, 40, 150, 0, Math.PI / 2, { vx: 0, vy: 120 }); return { cfg: { dodge: false }, tune: { diamond: false, lunge: true } }; },
+  // the mirror of S11: head-on, its nose at us -- a dart straight through its head is suicide and must be refused
+  S17_no_headon:  () => { reset(); put(Rabbit, 1, 40, 140, 0, Math.PI); return { cfg: { dodge: false }, tune: { diamond: false, lunge: true } }; },
+  // the same dart, with the ability switch on: 217 must ride the lunge, not just any boost
+  S12_ability:    () => { reset(); put(Rabbit, 1, 40, 150, 0, Math.PI / 2, { vx: 0, vy: 120 }); return { cfg: { dodge: false, ability: true }, tune: { diamond: false, lunge: true } }; },
+  // combat overlay must stay readable even with ESP off: target ring + cursor mark come from the PvP switch
+  S18_mark:       () => { reset(); put(Rabbit, 1, 40, 400, 0, Math.PI); return { cfg: { dodge: false, esp: false, radar: false, labels: false } }; },
+  // control for S18: nothing to show (PvP off, ESP off) -> the same pixel probe must come back empty
+  S19_blind:      () => { reset(); put(Rabbit, 1, 40, 400, 0, Math.PI); return { cfg: { pvp: false, dodge: false, esp: false, radar: false, labels: false } }; },
+  // target choice: a nearer low-tier snack must not hijack an equal-tier duel
+  S13_tier:       () => { reset(); const snack = put(Rabbit, 0, 25, 300, 0, 0); const duel = put(Rabbit, 1, 40, 520, 0, 0);
+                          H.wantId = duel.ce.id; return { cfg: { dodge: false } }; },
+  // target choice: with two equal-tier foes the one under the mouse cursor wins, even if it is farther
+  S14_cursor:     () => { reset(); input.pointer = { x: 1100, y: 250 };
+                          put(Rabbit, 1, 40, 500, 260, 0); const onCursor = put(Rabbit, 1, 40, 600, -180, 0);
+                          H.wantId = onCursor.ce.id; return { cfg: { dodge: false } }; },
+  // controls for the two biases above: with the weight switched off the SAME world must pick the other
+  // animal, which proves the bias is what decides and not luck of the geometry.
+  S15_tier_ctl:   () => { reset(); const snack = put(Rabbit, 0, 25, 300, 0, 0); put(Rabbit, 1, 40, 520, 0, 0);
+                          H.wantId = snack.ce.id; return { cfg: { dodge: false }, tune: { tierWeight: 0, cursorWeight: 0 } }; },
+  S16_cursor_ctl: () => { reset(); input.pointer = { x: 1100, y: 250 }; const nearer = put(Rabbit, 1, 40, 500, 260, 0);
+                          put(Rabbit, 1, 40, 600, -180, 0); H.wantId = nearer.ce.id;
+                          return { cfg: { dodge: false }, tune: { cursorWeight: 0 } }; },
+  // --- duel arena (game data, not a guess): the arena's other player is the target even past the
+  //     normal engage radius, and animals fenced into somebody else's arena are never candidates.
+  S20_duel_far_on: () => { reset(); const foe = put(Rabbit, 1, 40, 1500, 0, Math.PI); mkArena(player, foe);
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false } }; },
+  // control: same world, arena opponent switched off -> nothing is in range, so the bot must NOT invent
+  // a target. This proves S20 is decided by the arena data and not by luck of the geometry.
+  S21_duel_far_off: () => { reset(); const foe = put(Rabbit, 1, 40, 1500, 0, Math.PI); mkArena(player, foe);
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, autoDuel: false } }; },
+  // a pair duelling inside an arena elsewhere must not pull us in, even though they are the closest
+  S22_fence_pair: () => { reset(); const a = put(Rabbit, 1, 40, 300, 0, 0), b = put(Rabbit, 1, 40, 350, 60, 0);
+                          mkArena(a, b); const free = put(Rabbit, 1, 40, 700, 0, 0);
+                          H.wantId = free.ce.id; return { cfg: { dodge: false } }; },
+  // control for S22: identical world without the arena stamps -> the nearest animal wins
+  S23_fence_ctl: () => { reset(); const a = put(Rabbit, 1, 40, 300, 0, 0), b = put(Rabbit, 1, 40, 350, 60, 0);
+                          put(Rabbit, 1, 40, 700, 0, 0); H.wantId = a.ce.id; return { cfg: { dodge: false } }; },
+  // --- click-to-target, driven through a REAL mousedown on the game field at the animal's drawn spot
+  S24_pick_far: () => { reset(); put(Rabbit, 1, 40, 300, 0, 0); const far = put(Rabbit, 1, 40, 850, 120, 0);
+                          H.wantId = far.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; armPick(); H.click = clickAt(far.ce); } }; },
+  // the picked animal dies mid-fight: the pick must clear and control must fall back to the auto pick
+  S25_pick_dead: () => { reset(); const near = put(Rabbit, 1, 40, 300, 0, 0); const far = put(Rabbit, 1, 40, 850, 120, 0);
+                          return { cfg: { dodge: false }, mid: t => {
+                            if (t === 200) { armPick(); H.click = clickAt(far.ce); }
+                            if (t === 900) far.ce.destroy(); } }; },
+  // the player's own order outranks our judgement: clicking a BEAR (tier 2 vs our 1) is taken, with a
+  // warning in the message -- refusing the pick was the old behaviour and the user rejected it.
+  S26_pick_big: () => { reset(); const bear = put(Bear, 2, 55, 400, 0, Math.PI, { speed: 0 });
+                          H.wantId = bear.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; armPick(); H.click = clickAt(bear.ce); } }; },
+  // a click that lands on empty ground must leave the previous choice alone
+  S27_pick_miss: () => { reset(); const foe = put(Rabbit, 1, 40, 500, 0, 0); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false }, mid: t => {
+                            if (t === 200) { armPick(); H.click = clickAt(foe.ce); }
+                            if (t === 600) { armPick(); H.miss = clickXY(H.click.x + 320, H.click.y + 210); } } }; },
+  // --- retaliation: whoever is going for our tail outranks a nearer snack (control: switch off)
+  // --- retaliation: whoever is going for our tail outranks a nearer snack (control: switch off).
+  //     The attacker has to sit inside the tail-hunter window ((mr+er)*2.2 = 88), and the snack has to be
+  //     the SHORTER chase, otherwise distance alone decides and the switch has nothing to prove.
+  S28_retaliate: () => { reset(); const snack = put(Rabbit, 1, 40, 55, 0, 0, { speed: 0 }); const attacker = put(Rabbit, 1, 40, -80, 0, 0, { speed: 0 });
+                          H.wantId = attacker.ce.id; return { cfg: { dodge: false } }; },
+  S29_retaliate_off: () => { reset(); const snack = put(Rabbit, 1, 40, 55, 0, 0, { speed: 0 }); const attacker = put(Rabbit, 1, 40, -80, 0, 0, { speed: 0 });
+                          H.wantId = snack.ce.id; return { cfg: { dodge: false, retaliate: false } }; },
+  // an explicit click outranks the arena opponent (the player decides, even against our own preference)
+  S30_pick_vs_duel: () => { reset(); const out = put(Rabbit, 1, 40, 300, 0, 0); const foe = put(Rabbit, 1, 40, 600, 0, Math.PI);
+                          mkArena(player, foe); H.wantId = out.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; armPick(); H.click = clickAt(out.ce); } }; },
+  // ============================ v4: defensive states, hexagon, ring discipline ============================
+  // S13: whip ON (its own switch), equal foe circling slowly. The rig reads the hexagon counters
+  //      through __MOPE_WHIP before/after, so vertex switches and reversals are measured, not assumed.
+  S13_whip: () => { reset(); const foe = put(Rabbit, 1, 40, 300, 0, Math.PI, { homing: true, speed: 40 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, whip: true } }; },
+  // S14: a kiting foe (nose ~40deg on us, body sliding away). Control: the same world with the kite
+  //      detector switched off -> the bot drives straight into its head instead of strafing.
+  // S35: an AFK snack -- it faces us and does NOT move, so nothing about it can be timed. The bot has to
+  //      walk round to its tail and chew instead of parking nose-to-nose forever.
+  //      Control: the same world with the standstill detector disabled -> the old sit-and-wait.
+  S35_afk: () => { reset(); const foe = put(Rabbit, 1, 40, 320, 0, Math.PI, { speed: 0 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false }, tune: { pvpFast: false } }; },
+  S35_afk_ctl: () => { reset(); const foe = put(Rabbit, 1, 40, 320, 0, Math.PI, { speed: 0 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false }, tune: { pvpFast: false, stalkSpeed: 0, snapDeg: 181 } }; },
+  // S36: a foe that came in from BEHIND us. The orbit's mean nose angle is ~90 deg off the target, which
+  //      is exactly wrong here, so the snap-turn has to own the tick: pivot on the spot into his face.
+  //      Control: the same world with the pivot gate pushed out of reach.
+  S36_snap: () => { reset(); const foe = put(Rabbit, 1, 40, -340, 0, 0, { homing: true, speed: 130 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, whip: true } }; },
+  S36_snap_ctl: () => { reset(); const foe = put(Rabbit, 1, 40, -340, 0, 0, { homing: true, speed: 130 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, whip: true }, tune: { snapDeg: 181 } }; },
+  // S37: the body is ALREADY on our stern at t=0 (110 units, closing at 130). S36 measures a whole tail
+  //      event across the arena; this one measures the turn, which is what "он долго поворачивается" is about.
+  S37_snap_near: () => { reset(); const foe = put(Rabbit, 1, 40, -110, 0, 0, { homing: true, speed: 130 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, whip: true } }; },
+  S37_snap_near_ctl: () => { reset(); const foe = put(Rabbit, 1, 40, -110, 0, 0, { homing: true, speed: 130 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false, whip: true }, tune: { snapDeg: 181 } }; },
+  S14_bait: () => { reset(); const foe = put(Rabbit, 1, 40, 300, 0, Math.PI, { kite: true, speed: 110, kiteOff: 0.7 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false }, tune: { pvpFast: false } }; },
+  S14_bait_ctl: () => { reset(); const foe = put(Rabbit, 1, 40, 300, 0, Math.PI, { kite: true, speed: 110, kiteOff: 0.7 });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false }, tune: { pvpFast: false, kiteBack: 1e9 } }; },
+  // S15: an incoming dash -- server flag AND closing speed, so either detector alone still fires.
+  S15_dash: () => { reset(); const foe = put(Rabbit, 1, 40, 420, 0, Math.PI, { homing: true, speed: 1200, boosting: true });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false } }; },
+  S15_dash_dodge: () => { reset(); const foe = put(Rabbit, 1, 40, 420, 0, Math.PI, { homing: true, speed: 1200, boosting: true });
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false }, tune: { dashDodge: true } }; },
+  // The duel ring is a circle and standing outside the wall burns: this ring is 1600 wide with the
+  // opponent parked beyond it, so a bot without the clamp drives straight out of the fight.
+  S31_zone_hold: () => { reset(); const foe = put(Rabbit, 1, 40, 1500, 0, Math.PI);
+                          mkArena(player, foe, 1600, { x: player.x, y: player.y }); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false } }; },
+  // control: identical ring, guard neutralised through the tuning channel -> it really does leave
+  S32_zone_off: () => { reset(); const foe = put(Rabbit, 1, 40, 1500, 0, Math.PI);
+                          mkArena(player, foe, 1600, { x: player.x, y: player.y }); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false }, tune: { zoneMarginFrac: -1000 } }; },
+  // the ring SHRINKS while we fight: the guard has to re-read it every frame, not remember the first one
+  S33_zone_shrink: () => { reset(); const foe = put(Rabbit, 1, 40, 1300, 0, Math.PI);
+                          // the ring centre sits west of us, so we start 700 from it and the chase drives us
+                          // straight at the wall; then the wall moves in twice under us.
+                          const A = mkArena(player, foe, 2200, { x: player.x - 700, y: player.y }); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false }, mid: t => {
+                            if (t === 1200) A.size.x = A.size.y = 1900;
+                            if (t === 2000) A.size.x = A.size.y = 1700; } }; },
+  // same guard, ring data only on the networked twin (the shape the live bundle ends up using)
+  S34_zone_target: () => { reset(); const foe = put(Rabbit, 1, 40, 1500, 0, Math.PI);
+                          mkArena(player, foe, 1600, { x: player.x, y: player.y }, { viaTarget: true }); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false } }; },
+  // --- the pick trigger, the way a player actually uses it: no arming ritual, just a click
+  //     the foe sits 587 world units away from the streamed cursor point, so this can only pass through
+  //     the real click coordinates (cam.Bx) -- the old cursor-only hit test misses here.
+  S40_pick_tap: () => { reset(); put(Rabbit, 1, 40, 300, 0, 0); const far = put(Rabbit, 1, 40, 850, 120, 0);
+                          H.wantId = far.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; H.click = clickAt(far.ce); } }; },
+  // right button: no hold rule at all, and it works while a boost hold is in progress
+  S41_pick_rmb: () => { reset(); put(Rabbit, 1, 40, 300, 0, 0); const far = put(Rabbit, 1, 40, 850, -140, 0);
+                          H.wantId = far.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; H.click = clickAt(far.ce, 2); } }; },
+  // press-drag-release is a camera/aim gesture, not a pick: nothing may be chosen
+  S42_hold_drag: () => { reset(); const foe = put(Rabbit, 1, 40, 850, 120, 0);
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return;
+                            const s = cam.tq(foe.ce.position.x, foe.ce.position.y), k = cam.canvas.width / cam.canvas.clientWidth || 1;
+                            const x = s.x / k, y = s.y / k;
+                            downXY(x, y); upXY(x + 260, y + 180); H.click = { x: Math.round(x), y: Math.round(y) }; } }; },
+  // a plain press with no release yet (the player is boosting) must not pick either
+  S43_press_only: () => { reset(); const foe = put(Rabbit, 1, 40, 850, 120, 0);
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return;
+                            const s = cam.tq(foe.ce.position.x, foe.ce.position.y), k = cam.canvas.width / cam.canvas.clientWidth || 1;
+                            downXY(s.x / k, s.y / k); H.click = { x: Math.round(s.x / k), y: Math.round(s.y / k) }; } }; },
+  // the world the real-hold test (S44) runs in: a foe to click, nothing armed
+  S44_hold_world: () => { reset(); const foe = put(Rabbit, 1, 40, 850, 120, 0); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false } }; },
+  // --- measured op114 tempo, one scenario per rate the bundle's uA() can return. The foe sits close and
+  //     squares up, so some PvP branch is steering on every single decision -- an idle bot would "pass" by
+  //     sending nothing, and these runs are the regression guard for the pump.
+  S50_rate_arena: () => { reset(); const foe = put(Rabbit, 1, 40, 400, 0, Math.PI);
+                          mkArena(player, foe, 3000, { x: player.x + 200, y: player.y }); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false } }; },
+  S51_rate_mid:   () => { reset(); player.tier = player.ce.tier = 12; const foe = put(Rabbit, 12, 40, 400, 0, Math.PI);
+                          H.wantId = foe.ce.id; return { cfg: { dodge: false } }; },
+  S52_rate_low:   () => { reset(); const foe = put(Rabbit, 1, 40, 400, 0, Math.PI); H.wantId = foe.ce.id;
+                          return { cfg: { dodge: false } }; },
+  // the arena opponent is still the fallback, but a click on anybody else wins over it
+  S45_tap_over_duel: () => { reset(); const out = put(Rabbit, 1, 40, 300, 0, 0); const foe = put(Rabbit, 1, 40, 600, 0, Math.PI);
+                          mkArena(player, foe); H.wantId = out.ce.id;
+                          return { cfg: { dodge: false }, mid: t => { if (t !== 200) return; H.click = clickAt(out.ce); } }; },
+};
+
+H.start = (name, extra) => {
+  net.readyState = 'open';
+  H.wantId = null; H.click = null; H.miss = null;
+  const { cfg, tune, mid } = SCEN[name]() || {};
+  H.midFn = typeof mid === 'function' ? mid : null;   // an action to take at a given virtual ms
+  setCfg(cfg || {});
+  // `extra` is a per-run override that sits ON TOP of the scenario's own tune. Sweeps need it: without it
+  // every knob trial means editing the scenario table, and a scenario table full of one-off variants is
+  // exactly the noise that makes a regression invisible.
+  if (typeof window.__MOPE_CFG === 'function') window.__MOPE_CFG(Object.assign({}, TUNE_DEFAULT, tune || {}, extra || {}));
+  return name;
+};
+H.press = press;   // keep the raw keydown path reachable for a dedicated toggle test
+// the click-to-target path, exposed so a program can drive it exactly like a player does
+H.armPick = armPick; H.clickAt = clickAt; H.clickXY = clickXY;
+H.downXY = downXY; H.upXY = upXY; H.ringGeo = ringGeo;
+// the raw press, so a program can hold the button for REAL milliseconds between two CDP calls and prove
+// the userscript treats a hold as the game's boost instead of a pick (releaseXY finishes it).
+H.holdXY = (x, y) => { downXY(x, y); return { x: Math.round(x), y: Math.round(y) }; };
+H.toScreen = (wx, wy) => {
+  const s = cam.tq(wx, wy), k = cam.canvas.width / cam.canvas.clientWidth || 1;
+  return { x: +(s.x / k).toFixed(1), y: +(s.y / k).toFixed(1) };
+};
+
+// sample, after each bot decision, (a) how far the player's nose is from pointing at the
+// focus entity, and (b) the lateral offset of the bot's steer point from the focus, on the axis
+// perpendicular to player->focus. (a) small = "always facing"; (b) sign flips = "weaving".
+function faceSample() {
+  const f = sim.ents.get(H.focus);
+  if (!f || !sim.target) return;
+  const ax = f.x - player.x, ay = f.y - player.y, al = Math.hypot(ax, ay) || 1;
+  let g = null;
+  try { g = window.__MOPE_DIAG ? window.__MOPE_DIAG() : null; } catch (e) { g = null; }
+  let w = null;
+  try { w = window.__MOPE_WHIP ? window.__MOPE_WHIP() : null; } catch (e) { w = null; }
+  H.faceLog.push({
+    v: VIRT,               // the decision's own virtual instant: cadence-dependent maths must not guess it
+    mode: typeof window.__MOPE_MODE === 'function' ? window.__MOPE_MODE() : null,
+    // THE LEVER. What opcode 114 actually delivered, spoken as an angle on our OWN nose: the animal's turn
+    // rate is hard-clamped, so the only thing that can move instantly is this number, and how fast it moves
+    // IS the sharpness the user asks for. `ang` is the heading itself, for the body's own turn rate.
+    cur: sim.target ? +wrap(Math.atan2(sim.target.y - player.y, sim.target.x - player.x) - player.angle).toFixed(4) : null,
+    ang: +player.angle.toFixed(4),
+    // which footstep of the wave this tick is, and whether the beat note fired on it
+    lap: w && typeof w.lap === 'number' ? w.lap : null, tw: w ? !!w.twerk : null, df: w ? !!w.def : null,
+    aim: Math.abs(wrap(Math.atan2(ay, ax) - player.angle)),
+    perp: (sim.target.x - f.x) * (-ay / al) + (sim.target.y - f.y) * (ax / al),
+    dist: Math.round(al),
+    brg: Math.atan2(player.y - f.y, player.x - f.x),   // our bearing AROUND the foe: orbit progress
+    px: +player.x.toFixed(2), py: +player.y.toFixed(2),
+    rear: g ? !!g.rear : null, frontClear: g ? !!g.frontClear : null,
+    snap: typeof window.__MOPE_SNAP === 'function' ? window.__MOPE_SNAP() : null,
+    tgt: typeof window.__MOPE_TARGET === 'function' ? window.__MOPE_TARGET() : null,
+  });
+}
+
+// Deterministic driver: advance the model + one bot decision cycle under the virtual clock, no
+// dependence on wall-clock timers. ms of simulated time; input 4ms, sim 50ms, bot decision 4ms (the
+// shipped CFG.tickMs -- the rig MUST decide as often as the product does, or the cursor tempo measured
+// here is a fiction; the 120/s arena assertion is what pins this value).
+// Virtual time is monotonic across calls and bot/input caches are reset so scenarios stay isolated.
+// Fixed virtual origin, not perfNow(): the PvP weave is sin(now / faceWagMs), so an absolute start time
+// taken from the wall clock would give every scenario a different weave phase and results would drift
+// between runs. From here the model is a pure function of the scenario definition.
+let VT = 100000;
+// The steering pump defers op114 to the game's own next allowed boundary (lastSteer + 1000/uA()), which
+// sits BETWEEN the 4ms grid steps, and a wall-clock setTimeout cannot fire inside this synchronous loop.
+// So the rig drains it by hand: read the boundary off __MOPE_WHEEL, step the virtual clock exactly to it,
+// call __MOPE_PUMP. The grid itself stays on absolute time (VT is re-anchored, never += from the drained
+// value), so a fast send rate cannot silently stretch the scenario and give the world extra milliseconds.
+// The same pass records what the wheel held when the packet left, which is the only way to prove the
+// parked point gets OVERWRITTEN by newer decisions instead of queued behind them.
+function drainWheel(until) {
+  if (typeof window.__MOPE_PUMP !== 'function' || typeof window.__MOPE_WHEEL !== 'function') return;
+  for (let i = 0; i < 16; i++) {
+    const w = window.__MOPE_WHEEL();
+    if (!w.pending) { H.pend = null; return; }
+    const same = H.pend && Math.abs(H.pend.due - w.due) < 1e-6;
+    if (same && (H.pend.x !== w.x || H.pend.y !== w.y)) H.pend.replaced++;
+    if (!same) H.pend = { due: w.due, x: w.x, y: w.y, replaced: 0 };
+    if (w.due > until) return;                       // still parked when the next grid step arrives: fine
+    if (w.due > VIRT) VIRT = w.due;                  // send on the boundary, not on the grid
+    const n0 = H.wire.length;
+    window.__MOPE_PUMP();
+    if (H.wire.length === n0) continue;              // the pump declined to send: look at it again
+    const pk = H.wire[H.wire.length - 1];
+    H.wheelLog.push({
+      op: pk.op, at: pk.t, due: w.due, replaced: H.pend ? H.pend.replaced : 0,
+      want: pk.op === 114 && pk.payload ? { x: w.x, y: w.y } : null,
+      sent: pk.op === 114 && pk.payload ? { x: pk.payload.Jb / 65535 * MAX.x, y: pk.payload.zd / 65535 * MAX.y } : null,
+    });
+    H.pend = null;
+  }
+}
+H.step = (name, ms = 2500, extra) => {
+  H.start(name, extra);
+  if (typeof window.__MOPE_RESET === 'function') window.__MOPE_RESET();
+  VIRT = VT;
+  // The game's own wall-clock intervals stamp snapshots with the real clock while the page idles between
+  // programs. The forced model step below re-stamps every live entity at the virtual origin, so the tracker
+  // never inherits a real-time timestamp. The input schedule is pinned to the same origin, otherwise its
+  // phase (and how many pointer packets a scenario sees) depends on CDP round-trip time.
+  input.Hc = VIRT + 4;
+  // step the model once BEFORE the first decision, so the opening snapshot is virtual-stamped too
+  // (simWater is the model's own guard, so it has to be pulled back with lastSim or the first step no-ops)
+  simWater = VIRT - 999;
+  let lastSim = VIRT - 999, lastBot = VIRT;
+  for (let t = 0; t <= ms; t += 4) {
+    VT += 4; VIRT = VT; H.simT += 4;                // drainWheel never leaves VIRT ahead of the next VT
+    if (H.midFn) H.midFn(t);       // scenario actions (arm a pick, kill the target) at an exact ms
+    inputStep();
+    if (VIRT - lastSim >= 50) { simStep(); lastSim = VIRT; }
+    if (typeof window.__MOPE_TICK === 'function' && VIRT - lastBot >= 4) { window.__MOPE_TICK(); faceSample(); lastBot = VIRT; }
+    drainWheel(VT + 4);
+  }
+  const r = H.result();
+  // an armed pump must never outlive the scenario: it would fire on the wall clock and steer the player
+  if (typeof window.__MOPE_RELEASE === 'function') window.__MOPE_RELEASE();
+  VIRT = null;
+  return r;
+};
+
+H.result = () => {
+  const bot114 = [], client114 = [];
+  let boosts = 0, firstBot = null, lastBot = null;
+  for (const x of H.wire) {
+    if (x.op === 114) {
+      const p = { x: x.payload.Jb / 65535 * MAX.x, y: x.payload.zd / 65535 * MAX.y, t: x.t };
+      if (x.fromClient) client114.push(p);
+      else { bot114.push(p); if (!firstBot) firstBot = p; lastBot = p; }
+    } else if (x.op === 192) boosts++;
+  }
+  let maxPerSec = 0;
+  for (let i = 0; i < bot114.length; i++) {
+    let c = 0;
+    for (let j = i; j < bot114.length && bot114[j].t - bot114[i].t < 1000; j++) c++;
+    if (c > maxPerSec) maxPerSec = c;
+  }
+  // --- the actual cursor tempo, measured off the wire. This is what the pump changed: steer() used to
+  //     drop points that arrived a hair early, so the sent rate was a fraction of the native uA() rate.
+  const bt = bot114.map(p => p.t);
+  let gapMin = null, gapMax = null;
+  for (let i = 1; i < bt.length; i++) {
+    const g = bt[i] - bt[i - 1];
+    gapMin = gapMin == null ? g : Math.min(gapMin, g);
+    gapMax = gapMax == null ? g : Math.max(gapMax, g);
+  }
+  const span = bt.length > 1 ? bt[bt.length - 1] - bt[0] : 0;
+  const rate = {
+    n: bt.length, perSec: span > 0 ? +((bt.length - 1) * 1000 / span).toFixed(1) : null,
+    gapMin: gapMin == null ? null : +gapMin.toFixed(2), gapMax: gapMax == null ? null : +gapMax.toFixed(2),
+    maxPerSec, span: Math.round(span),
+  };
+  // --- every deferred send: did the packet carry the NEWEST parked point, exactly on its boundary?
+  const wl = (H.wheelLog || []).filter(e => e.want && e.sent);
+  const wheelErr = wl.length ? +Math.max(...wl.map(e => Math.hypot(e.want.x - e.sent.x, e.want.y - e.sent.y))).toFixed(1) : null;
+  const wheelLate = wl.length ? +Math.max(...wl.map(e => Math.abs(e.at - e.due))).toFixed(2) : null;
+  const wheelReplaced = wl.reduce((a, e) => a + (e.replaced > 0 ? 1 : 0), 0);
+  const wheelMaxReplaced = wl.length ? Math.max(...wl.map(e => e.replaced)) : null;
+  const E = window.__ENTS, focus = H.focus != null ? sim.ents.get(H.focus) : null;
+  const op217 = H.wire.filter(x => x.op === 217).length;
+  const face = (H.faceLog || []);
+  const modeHist = {}; for (const s of face) modeHist[s.mode] = (modeHist[s.mode] || 0) + 1;
+  const facing = face.filter(s => s.mode === 'face');
+  const aimMaxRad = facing.length ? Math.max(...facing.map(s => s.aim)) : null;
+  const aimAvgRad = facing.length ? facing.reduce((a, s) => a + s.aim, 0) / facing.length : null;
+  // worst aim across every phase where the nose must stay on the focus: a back-turn (old diamond) shows ~180
+  const approach = face.filter(s => ['face', 'lunge', 'diamond', 'jink', 'bite'].includes(s.mode));
+  const aimWorstRad = approach.length ? Math.max(...approach.map(s => s.aim)) : null;
+  const shake = face.filter(s => ['face', 'jink', 'diamond'].includes(s.mode)).map(s => s.perp);
+  let shakeFlips = 0; for (let i = 1; i < shake.length; i++) if (shake[i - 1] * shake[i] < 0) shakeFlips++;
+  const jinkS = face.filter(s => s.mode === 'jink');
+  const jinkWagAmp = jinkS.length ? Math.round(Math.max(...jinkS.map(s => Math.abs(s.perp)))) : null;
+  // aim at the close of the last combat phase: after the turn-to-face completes, the nose should be on it
+  const approachS = face.filter(s => ['face', 'lunge', 'diamond', 'jink', 'bite'].includes(s.mode));
+  const endAimDeg = approachS.length ? +(approachS[approachS.length - 1].aim * 180 / Math.PI).toFixed(1) : null;
+  // virtual ms the model needed to bring the nose inside 30 deg of the focus. A 180 deg turn cannot
+  // take less than 150 deg / (4 rad/s) = 654ms, so a near-zero value means the turn clamp is broken.
+  const faceIx = approachS.length ? approachS.findIndex(s => s.aim <= Math.PI / 6) : -1;
+  // measured between the two virtual stamps: the old faceIx * 16 assumed one decision per 16ms and would
+  // report a 4x wrong turn time the moment the decision period changed
+  const turnMs = approachS.length && faceIx >= 0 ? Math.round(approachS[faceIx].v - approachS[0].v) : null;
+  const perp = face.filter(s => s.mode === 'face').map(s => s.perp);
+  let perpFlips = 0, perpAbs = 0;
+  for (let i = 1; i < perp.length; i++) if (perp[i - 1] * perp[i] < 0) perpFlips++;
+  if (perp.length) perpAbs = Math.max(...perp.map(Math.abs));
+  // the head-on guard needs more than a final snapshot: the dart gate has to be seen CLOSED in front of
+  // the foe's nose and OPEN once we are behind it, otherwise it is just another dead constant.
+  const dg = face.filter(s => s.frontClear != null);
+  const diagBlocked = dg.filter(s => !s.frontClear).length;
+  const diagBlockedWhileRear = dg.filter(s => !s.frontClear && s.rear).length;
+  const diagClearBehind = dg.filter(s => s.frontClear && s.rear).length;
+  const diagLungeBlocked = dg.filter(s => s.mode === 'lunge' && !s.frontClear).length;
+  const firstLungeIx = dg.findIndex(s => s.mode === 'lunge');
+  const firstBlockedIx = dg.findIndex(s => !s.frontClear);
+  // which animal the lock actually drove each tick. A final snapshot can be luck; a histogram cannot.
+  const tgtHist = {};
+  for (const s of face) { const k = s.tgt == null ? 'none' : String(s.tgt); tgtHist[k] = (tgtHist[k] || 0) + 1; }
+  let topTargetId = null, topN = 0;
+  for (const k in tgtHist) if (tgtHist[k] > topN) { topN = tgtHist[k]; topTargetId = k === 'none' ? null : +k; }
+  // v4: hexagon counters, the phases the new branches emit, and how far out of the duel ring the bot
+  // ever asked to steer (measured on the DECODED opcode-114 points, not on our own guess).
+  const whip = typeof window.__MOPE_WHIP === 'function' ? window.__MOPE_WHIP() : null;
+  const zone = typeof window.__MOPE_ZONE === 'function' ? window.__MOPE_ZONE() : null;
+  const ring = ringGeo(player && player.ce.arena);
+  const zoneWorst = ring && bot114.length
+    ? Math.round(Math.max(...bot114.map(p => Math.hypot(p.x - ring.c.x, p.y - ring.c.y)))) : null;
+  // the steer point is only half the story: momentum carries the body, so measure the body against the
+  // ring that existed on THAT sample (the duel circle shrinks, so a final radius would be a lie).
+  const bodyOutMax = H.ptrace.length ? Math.max(...H.ptrace.map(s => s.d)) : null;
+  const bodyOutTicks = H.ptrace.length ? H.ptrace.filter(s => s.d > s.R).length : null;
+  const zoneOver = H.ptrace.length ? Math.max(...H.ptrace.map(s => s.d - s.R)) : null;
+  // an instant shrink leaves any body outside for a moment -- what has to be proven is that the bot
+  // drives back in, so grade the margin over the LAST samples against the ring that was live then.
+  const ztail = H.ptrace.slice(-10);
+  const zoneTailOver = ztail.length ? Math.max(...ztail.map(s => s.d - s.R)) : null;
+  const zoneRseq = H.ptrace.map(s => s.R).filter((v, i, a) => a.indexOf(v) === i);
+  const zoneSelf = zone ? zone.selfOut : null, zoneGap = zone ? zone.gap : null;
+  const deg = arr => arr.length ? +(Math.max(...arr.map(s => s.aim)) * 180 / Math.PI).toFixed(1) : null;
+  const avgDeg = arr => arr.length ? +(arr.reduce((a, s) => a + s.aim, 0) / arr.length * 180 / Math.PI).toFixed(1) : null;
+  const whipS = face.filter(s => s.mode === 'whip'), baitS = face.filter(s => s.mode === 'bait'), dashS = face.filter(s => s.mode === 'dashdef');
+  // an orbit that is worth having stays glued to the foe: measure the ring it actually walks.
+  const whipR = whipS.map(s => s.dist).filter(Number.isFinite);
+  // The three complaints, measured rather than argued about. contact = the two bodies touching, so a
+  // sample below it in a NON-bite mode means we drove our model into the enemy's model. The sweep is the
+  // angle we actually walked around the foe, and a hop stride is how far the body really moved in the
+  // 200ms after a boost -- a hop that buys nothing is a hop that should not have been spent.
+  const contact = focus ? player.r + focus.r : null;
+  const softT = H.touch.filter(t => ['face', 'diamond', 'bait', 'whip'].indexOf(t.mode) >= 0);
+  const whipT = H.touch.filter(t => t.mode === 'whip');
+  const pen = arr => arr.length ? +(Math.max(...arr.map(t => t.need - t.d))).toFixed(0) : 0;
+  const whipJamTicks = whipT.length, jamTicks = softT.length, jamPct = +(100 * softT.length / Math.max(1, H.simT / 50)).toFixed(1);
+  const whipPenMax = pen(whipT), penMax = pen(softT);
+  // the same two numbers, attributed: SELF = we were pointed at him (a whip that must never happen),
+  // FOE = he ran into our nose/side while we were turned away (the ring cannot cancel that).
+  const whipPenSelf = pen(whipT.filter(t => !t.away)), whipPenFoe = pen(whipT.filter(t => t.away));
+  const whipJamSelf = whipT.filter(t => !t.away).length, whipJamFoe = whipT.length - whipJamSelf;
+  // signed: a step forward and a drift back must NOT count as orbit, so the net figure is the honest one
+  let sweep = 0, sweepAbs = 0;
+  for (let i = 1; i < whipS.length; i++) { const dd = wrap(whipS[i].brg - whipS[i - 1].brg); sweep += dd; sweepAbs += Math.abs(dd); }
+  const whipSpan = whipS.length > 1 ? whipS[whipS.length - 1].v - whipS[0].v : 0;
+  const whipSweepDeg = whipS.length > 1 ? +(Math.abs(sweep) * 180 / Math.PI).toFixed(0) : null;
+  const whipSweepAbs = whipS.length > 1 ? +(sweepAbs * 180 / Math.PI).toFixed(0) : null;
+  // "лицом к нему" has to be measured as a snap, not as an average: an animal that travels a circle is
+  // tangential to it, so a permanently on-target nose and a real orbit exclude each other by geometry.
+  const whipFacePct = whipS.length ? +(100 * whipS.filter(s => s.aim * 180 / Math.PI <= 30).length / whipS.length).toFixed(1) : null;
+  const whipSnapPct = whipS.length ? +(100 * whipS.filter(s => s.aim * 180 / Math.PI <= 45).length / whipS.length).toFixed(1) : null;
+  const whipSweepRate = whipSpan > 200 ? +(sweep * 180 / Math.PI / (whipSpan / 1000)).toFixed(0) : null;
+  const strides = [];
+  for (const pk of H.wire) {
+    if (pk.op !== 192) continue;
+    let ix = -1;
+    for (let i = 0; i < H.faceLog.length; i++) { if (H.faceLog[i].v <= pk.t) ix = i; else break; }
+    if (ix < 0 || H.faceLog[ix].mode !== 'whip') continue;
+    const a = H.faceLog[ix];
+    let b = null;
+    for (let i = ix + 1; i < H.faceLog.length; i++) if (H.faceLog[i].v >= a.v + 200) { b = H.faceLog[i]; break; }
+    if (b) strides.push(Math.round(Math.hypot(b.px - a.px, b.py - a.py)));
+  }
+  const hopStride = strides.length ? { n: strides.length, min: Math.min(...strides),
+    avg: Math.round(strides.reduce((a, b) => a + b, 0) / strides.length) } : null;
+  const whipRange = whipR.length ? { avg: Math.round(whipR.reduce((a, b) => a + b, 0) / whipR.length),
+    max: Math.max(...whipR), min: Math.min(...whipR) } : null;
+  // SHARPNESS, measured on the only lever the game gives us. The turn rate is hard-clamped at 4 rad/s, so a
+  // programme cannot turn faster than that no matter what it wants -- it can only hand the cursor over in
+  // bigger, fewer, more abrupt steps. swingDegS = how much the cursor angle on our own nose travels per
+  // second (total absolute swing / time); swingMaxDeg = the single biggest jump the game ever received;
+  // swingHz = how often per second it changes direction (the left-right rate the user counts); turnDegS =
+  // what the body actually managed. A smooth wave and a sharp one sweep the SAME total angle -- these
+  // numbers are what separate them.
+  let swAbs = 0, swMax = 0, tnAbs = 0, swHz = 0, swPrev = 0;
+  const swS = whipS.filter(s => Number.isFinite(s.cur) && Number.isFinite(s.ang));
+  for (let i = 1; i < swS.length; i++) {
+    const dt = swS[i].v - swS[i - 1].v;
+    if (dt <= 0) continue;
+    const d = wrap(swS[i].cur - swS[i - 1].cur);
+    swAbs += Math.abs(d);
+    tnAbs += Math.abs(wrap(swS[i].ang - swS[i - 1].ang));
+    if (Math.abs(d) > Math.abs(swMax)) swMax = d;
+    const rate = d / dt;
+    if (rate !== 0 && swPrev !== 0 && Math.sign(rate) !== Math.sign(swPrev)) swHz++;
+    if (rate !== 0) swPrev = rate;
+  }
+  const swSec = swS.length > 1 ? (swS[swS.length - 1].v - swS[0].v) / 1000 : 0;
+  const sharp = swSec > 0.2;
+  const swingDegS = sharp ? +(swAbs * 180 / Math.PI / swSec).toFixed(0) : null;
+  const turnDegS = sharp ? +(tnAbs * 180 / Math.PI / swSec).toFixed(0) : null;
+  const swingHz = sharp ? +(swHz / swSec).toFixed(1) : null;
+  const swingMaxDeg = sharp ? +(Math.abs(swMax) * 180 / Math.PI).toFixed(1) : null;
+  let twerkTicks = 0, defTicks = 0, whipLaps = 0;
+  for (const s of whipS) {
+    if (s.tw) twerkTicks++;
+    if (s.df) defTicks++;
+    if (typeof s.lap === 'number' && s.lap > whipLaps) whipLaps = s.lap;
+  }
+  // Reaction timing. Two figures, deliberately separated: REAR DWELL (how often a foe ends up behind our
+  // beam at all -- the orbit's own brake phase puts us there by design, so it is context, not a verdict)
+  // and SNAP TIME (how long one of those events actually keeps us turned away, measured with the shipped
+  // gate's own 150/100 hysteresis, hard-coded so widening the tuning cannot flatter its own measurement).
+  let rearTicks = 0, runStart = 0, snapRun = [], snapTicks = 0;
+  // snapAvgMs above measures the WHOLE tail event: it starts the stopwatch the instant our nose is 150 deg
+  // off the foe, wherever he is, so on a long chase it reports how fast HE closes rather than how fast we
+  // turn. faceAvgMs is the reflex's own clock: it starts when the nose is 150 deg off AND the body is inside
+  // 1.6 contact diameters (already in biting range), and stops at 100. Two numbers, two questions.
+  let dwell = 0, faceRun = [];
+  const nearD = contact ? Math.round(contact * 1.6) : 128;
+  for (const q of H.faceLog) {
+    const ad = q.aim * 180 / Math.PI;
+    if (q.snap) snapTicks++;
+    if (ad > 110) rearTicks++;
+    if (ad > 150) {
+      if (!runStart) runStart = q.v;
+      if (!dwell && q.dist < nearD) dwell = q.v;
+    } else if (ad < 100) {
+      if (runStart) { snapRun.push(q.v - runStart); runStart = 0; }
+      if (dwell) { faceRun.push(q.v - dwell); dwell = 0; }
+    }
+  }
+  const snapOpen = runStart ? H.faceLog[H.faceLog.length - 1].v - runStart : 0;
+  const snapAvgMs = snapRun.length ? Math.round(snapRun.reduce((a, b) => a + b, 0) / snapRun.length) : null;
+  const snapWorstMs = Math.max(snapRun.length ? Math.max(...snapRun) : 0, snapOpen) || null;
+  const rearPct = H.faceLog.length ? +(100 * rearTicks / H.faceLog.length).toFixed(1) : null;
+  const faceOpenMs = dwell ? H.faceLog[H.faceLog.length - 1].v - dwell : 0;
+  const faceAvgMs = faceRun.length ? Math.round(faceRun.reduce((a, b) => a + b, 0) / faceRun.length) : null;
+  const faceWorstMs = Math.max(faceRun.length ? Math.max(...faceRun) : 0, faceOpenMs) || null;
+  const pick = typeof window.__MOPE_PICKSTATE === 'function' ? window.__MOPE_PICKSTATE() : null;
+  return {
+    tgtHist, topTargetId, pick, click: H.click || null, miss: H.miss || null,
+    whip, zone, zoneWorst, zoneLim: zone && zone.lim, bodyOutMax, bodyOutTicks,
+    zoneOver, zoneTailOver, zoneRseq, zoneSelf, zoneGap, ringR: ring && Math.round(ring.R), ringD: ring && ring.D,
+    whipAimAvgDeg: avgDeg(whipS), whipAimWorstDeg: deg(whipS), whipTicks: whipS.length, whipRange,
+    contact, whipJamTicks, jamTicks, jamPct, whipPenMax, penMax, whipPenSelf, whipPenFoe, whipJamSelf, whipJamFoe, whipSweepDeg, whipSweepAbs, whipFacePct, whipSnapPct, whipSweepRate, hopStride,
+    swingDegS, swingMaxDeg, swingHz, turnDegS, twerkTicks, defTicks, whipLaps,
+    rearTicks, rearPct, snapTicks, snapRuns: snapRun.length, snapAvgMs, snapWorstMs,
+    faceRuns: faceRun.length, faceAvgMs, faceWorstMs, nearD,
+    baitAimAvgDeg: avgDeg(baitS), baitRange: baitS.length ? Math.round(baitS.reduce((a, s) => a + s.dist, 0) / baitS.length) : null,
+    baitTicks: baitS.length, dashdefTicks: dashS.length,
+    focusEnd: focus ? Math.round(dist(focus, player)) : null,
+    diagTicks: dg.length, diagBlocked, diagBlockedWhileRear, diagClearBehind,
+    diagLungeBlocked, firstLungeIx, firstBlockedIx,
+    op217, aimMaxDeg: aimMaxRad != null ? +(aimMaxRad * 180 / Math.PI).toFixed(1) : null,
+    // what the bot locked vs what the scenario wants, and the cursor point read back from opcode 114
+    wantId: H.wantId ?? null,
+    targetId: typeof window.__MOPE_TARGET === 'function' ? window.__MOPE_TARGET() : null,
+    cursor: typeof window.__MOPE_CURSOR === 'function' ? window.__MOPE_CURSOR() : null,
+    aimAvgDeg: aimAvgRad != null ? +(aimAvgRad * 180 / Math.PI).toFixed(1) : null,
+    aimWorstDeg: aimWorstRad != null ? +(aimWorstRad * 180 / Math.PI).toFixed(1) : null,
+    shakeFlips, jinkWagAmp, endAimDeg, turnMs,
+    perpFlips, perpAbs: Math.round(perpAbs), modeHist,
+    hooked: !!window.__HOOKED, M: window.__M === game, realm: H.realmCapturedPatched,
+    toggles: [...document.querySelectorAll('#mopeCheatPanel input')].map(c => c.checked),
+    client114: client114.length, bot114: bot114.length, maxPerSec, boosts, firstBot, lastBot,
+    rate, wheelErr, wheelLate, wheelReplaced, wheelMaxReplaced, wheelPending: (H.wheelLog || []).length,
+    clientAfterFirstBot: firstBot ? client114.filter(p => p.t > firstBot.t + 60).length : null,
+    bites: H.bites, deaths: H.deaths,
+    mode: typeof window.__MOPE_MODE === 'function' ? window.__MOPE_MODE() : null,
+    selfSubspecies: player.ce.subspecies ?? 0,
+    initCalls: H.initCalls | 0,
+    tracked: E ? [...E.keys()] : null,
+    player: { x: Math.round(player.x), y: Math.round(player.y), angle: +player.angle.toFixed(2) },
+    focusDist: focus ? Math.round(dist(focus, player)) : null,
+    focusMin: H.focus != null && Number.isFinite(H.minDist[H.focus]) ? Math.round(H.minDist[H.focus]) : null,
+    focusStart: H.focusStart,
+    errors: H.errors.slice(), elapsed: Math.round(performance.now() - H.t0),
+  };
+};
+H.sample = (wx, wy) => {                 // opaque overlay pixels in a 44px box around a world point
+  const ov = document.getElementById('mopeCheatOverlay');
+  if (!ov) return -1;
+  const p = cam.tq(wx, wy), k = cam.canvas.width / cam.canvas.clientWidth, dpr = ov.width / window.innerWidth;
+  const sx = p.x / k * dpr, sy = p.y / k * dpr, R = 22 * dpr;
+  const x0 = Math.max(0, Math.floor(sx - R)), y0 = Math.max(0, Math.floor(sy - R));
+  const w = Math.min(ov.width, Math.ceil(sx + R)) - x0, h = Math.min(ov.height, Math.ceil(sy + R)) - y0;
+  if (w <= 0 || h <= 0) return -2;
+  const d = ov.getContext('2d').getImageData(x0, y0, w, h).data;
+  let n = 0;
+  for (let i = 3; i < d.length; i += 4) if (d[i]) n++;
+  return n;
+};
+H.focusPos = () => { const s = sim.ents.get(H.focus); return s ? { x: s.ce.position.x, y: s.ce.position.y } : null; };
+H.playerPos = () => ({ x: player.ce.position.x, y: player.ce.position.y });
+
+reset();
+</script>
+</body>
+</html>
