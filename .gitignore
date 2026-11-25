@@ -1,0 +1,3 @@
+# Built from Mopeio/src/*.b64 by the launcher/tests; kept out of git so the
+# repository stays connector-friendly (parts only).
+Mopeio/mope-cheat.user.js
